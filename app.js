@@ -4178,7 +4178,7 @@ function toggleSpellcheck() {
 const SPELL_LANGUAGE_NAMES = {
   'en-US': t('US English'), 'en-GB': t('UK English'), 'en-CA': t('Canadian English'),
   'en-AU': t('Australian English'), fr: t('French'), es: t('Spanish'), de: t('German'),
-  nl: t('Dutch'), pl: t('Polish')
+  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': 'Português (Brasil)'
 };
 async function changeSpellLanguage(code) {
   const ok = await window.neo.setSpellLanguage(code);
