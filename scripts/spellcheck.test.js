@@ -20,6 +20,34 @@ test('Romanian compatibility keeps suffixes, prefixes and their combinations', (
     dic: '1\nword/A\n'
   });
   const spell = nspell(dict);
+
+function asyncSpellWorker() {
+  let handle;
+  const pending = new Map();
+  const context = vm.createContext({
+    require: localRequire,
+    process: { parentPort: {
+      on: (_name, callback) => { handle = callback; },
+      postMessage: (message) => pending.get(message.id)?.(message)
+    } }
+  });
+  vm.runInContext(source('spell-worker.js'), context);
+  let id = 0;
+  return (message) => new Promise((resolve) => {
+    const requestId = ++id;
+    pending.set(requestId, resolve);
+    handle({ data: { id: requestId, ...message } });
+  });
+}
+
+test('worker loads the Portuguese trie using the main-process message shape', async () => {
+  const send = asyncSpellWorker();
+  const dictionaryPath = path.join(root, 'dict', 'pt_BR.trie.gz');
+  assert.equal((await send({ type: 'load', language: 'pt-BR', dictionaryPath })).ok, true);
+  const result = await send({ type: 'check', words: ['biblioteca', 'bibliotca'] });
+  assert.equal(result.ok, true);
+  assert.deepEqual({ ...result.result }, { biblioteca: true, bibliotca: false });
+});
   for (const word of ['word', 'words', 'reword', 'rewords']) assert.ok(spell.correct(word), word);
   assert.equal(spell.correct('wordss'), false);
 });

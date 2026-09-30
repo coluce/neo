@@ -23,7 +23,7 @@ async function handleMessage(msg) {
   try {
     if (msg.type === 'load') {
       learnedWords = new Set(msg.custom || []);
-      if (msg.locale === 'pt-BR') {
+      if (msg.language === 'pt-BR') {
         ptBrDictionaryPath = msg.dictionaryPath;
         spell = null;
         await spellPortuguese('biblioteca', ptBrDictionaryPath, learnedWords);
