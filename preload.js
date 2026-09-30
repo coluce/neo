@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('neo', {
   deleteBook: (bookId, title) => ipcRenderer.invoke('book:delete', bookId, title),
 
   readChapter: (bookId, chId) => ipcRenderer.invoke('chapter:read', bookId, chId),
+  chapterStamps: (bookId) => ipcRenderer.invoke('chapter:stamps', bookId),
   writeChapter: (bookId, chId, html) => ipcRenderer.invoke('chapter:write', bookId, chId, html),
   deleteChapter: (bookId, chId) => ipcRenderer.invoke('chapter:delete', bookId, chId),
 
@@ -48,6 +49,7 @@ contextBridge.exposeInMainWorld('neo', {
 
   poetryState: (on) => ipcRenderer.send('poetry:state', on),
   typewriterState: (st) => ipcRenderer.send('typewriter:state', st),
+  uiZoomState: (z) => ipcRenderer.send('uizoom:state', z),
   // interface language, fetched once before the page's scripts run
   i18n: ipcRenderer.sendSync('i18n:get'),
   reloadForLanguage: () => ipcRenderer.invoke('i18n:reload'),

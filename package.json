@@ -1,14 +1,15 @@
 {
   "name": "neo",
   "productName": "NEO",
-  "version": "0.9.1",
+  "version": "1.1.0",
   "description": "A word processor for authors. Distraction-free by default.",
   "homepage": "https://github.com/hughhowey/neo",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "build:dict:pt-br": "node scripts/build-pt-br-dictionary.js",
-    "test:spellcheck": "node tests/spellcheck-pt-br.test.js",
+    "test:spellcheck": "node --test scripts/spellcheck.test.js",
+    "test:spellcheck:pt-br": "node tests/spellcheck-pt-br.test.js",
     "package": "electron-builder --mac",
     "package:win": "electron-builder --win",
     "package:linux": "electron-builder --linux",
@@ -86,6 +87,15 @@
       "oneClick": true,
       "deleteAppDataOnUninstall": false
     },
+    "asarUnpack": [
+      "node_modules/dictionary-ro/**"
+    ],
+    "extraResources": [
+      {
+        "from": "licenses/dictionary-ro",
+        "to": "app.asar.unpacked/node_modules/dictionary-ro"
+      }
+    ],
     "files": [
       "**/*",
       "!pocket/**",
@@ -94,6 +104,7 @@
       "!*.md",
       "!.github/**",
       "!scripts/**",
+      "!licenses/**",
       "!locales/_template.json"
     ]
   },
@@ -115,6 +126,8 @@
     "dictionary-fr": "^3.0.0",
     "dictionary-nl": "^2.0.0",
     "dictionary-pl": "^2.0.0",
+    "dictionary-ro": "3.0.0",
+    "dictionary-ru": "^3.0.0",
     "electron-updater": "^6.3.9",
     "jszip": "^3.10.1",
     "nspell": "^2.1.5"

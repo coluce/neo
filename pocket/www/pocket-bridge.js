@@ -174,7 +174,7 @@
         for (const name of await listDir('')) {
           if (!String(name).startsWith('book-')) continue;
           const m = await readJSONFile(p(name, 'book.json'), null);
-          if (m && m.id) out.push({ id: m.id, title: m.title || 'Untitled', author: m.author || '', modified: m.modified || '' });
+          if (m && m.id) out.push({ id: m.id, title: m.title || 'Untitled', author: m.author || '', modified: m.modified || '', kind: m.kind || '' });
         }
       } catch { /* an empty list is honest enough */ }
       return out;
@@ -209,9 +209,34 @@
       await writeJSONFile(p(id, 'stickies.json'), []);
       return book;
     },
-    deleteBook: async () => false, // manage the shelves from your Mac
+    // the folder goes; on iOS the Files app keeps it in Recently Deleted
+    deleteBook: async (bookId) => {
+      try {
+        await ready;
+        await FS().rmdir({ ...at(bookId), recursive: true });
+        return true;
+      } catch (err) {
+        showErrorDetail('Could not delete ' + bookId + ': ' + (err && err.message || err));
+        return false;
+      }
+    },
 
     /* ---------- chapters ---------- */
+    // {chId: mtime and size}: lets app.js re-read only what changed on disk
+    // (the size too: Syncthing and iCloud keep the other device's mtime, and
+    // two saves in the same second must not look alike)
+    chapterStamps: async (bookId) => {
+      const out = {};
+      try {
+        await ready;
+        const ls = await FS().readdir(at(p(bookId, 'chapters')));
+        for (const f of ls.files || []) {
+          const name = (f && f.name) || String(f);
+          if (name.endsWith('.html')) out[name.slice(0, -5)] = ((f && f.mtime) || 0) + ':' + ((f && f.size) || 0);
+        }
+      } catch { /* no chapters yet */ }
+      return out;
+    },
     readChapter: async (bookId, chId) => {
       await fetchCloud(p(bookId, 'chapters', chId + '.html'));
       try { return await readText(p(bookId, 'chapters', chId + '.html')); } catch { return ''; }
@@ -254,7 +279,37 @@
     removeCover: async () => true,
 
     /* ---------- desktop powers, politely absent ---------- */
-    exportSave: async () => null,
+    // Export: the page builds the file (txt/md/html as text, docx/epub as
+    // zip entries); it is written to the app's cache and handed to the
+    // system share sheet — AirDrop, Files, Mail, whatever the writer picks.
+    exportSave: async ({ format, defaultName, content, zipEntries }) => {
+      try {
+        const Share = window.Capacitor.Plugins.Share;
+        if (!Share) throw new Error('Sharing is not available in this build');
+        if (format === 'pdf') { if (typeof toast === 'function') toast('PDF export happens on the desktop — html, docx and epub work here'); return null; }
+        const name = (defaultName || 'book') + '.' + format;
+        let data;
+        let encoding = 'utf8';
+        if (zipEntries) {
+          if (!window.JSZip) throw new Error('Zip support missing');
+          const zip = new window.JSZip();
+          // same shape main.js zips on the desktop: [{path, content, base64?, store?}]
+          for (const e of zipEntries) {
+            zip.file(e.path, e.content, { base64: !!e.base64, compression: e.store ? 'STORE' : 'DEFLATE' });
+          }
+          data = await zip.generateAsync({ type: 'base64', compression: 'DEFLATE', mimeType: 'application/epub+zip' });
+          encoding = undefined; // base64 to the plugin
+        } else {
+          data = content;
+        }
+        const w = await FS().writeFile({ path: 'exports/' + name, directory: 'CACHE', data, encoding, recursive: true });
+        await Share.share({ title: name, url: w.uri });
+        return name;
+      } catch (err) {
+        if (!/cancel/i.test(String(err && err.message || err))) showErrorDetail('Export failed: ' + (err && err.message || err));
+        return null;
+      }
+    },
     emailDraft: async () => ({ ok: false }),
     importFiles: async () => [],
     importPick: async () => [],
@@ -285,6 +340,58 @@
   };
   window.pocketState = { poetry: false, typewriter: false };
 
+  // Interface language: the same locales/ files as the desktop, picked by
+  // the device's language (regional file over its base, English beneath).
+  // Read synchronously here because app.js reads window.neo.i18n as it loads.
+  function loadLocale() {
+    const want = String(navigator.language || 'en').replace('_', '-');
+    const base = want.split('-')[0];
+    const get = (code) => {
+      try {
+        const x = new XMLHttpRequest();
+        x.open('GET', 'locales/' + code + '.json', false);
+        x.send();
+        if (x.responseText && (x.status === 200 || x.status === 0)) return JSON.parse(x.responseText);
+      } catch { /* no such language */ }
+      return null;
+    };
+    const english = get('en') || {};
+    if (base === 'en') return { locale: 'en', dict: {}, base: english };
+    const baseDict = get(base);
+    const regional = want !== base ? get(want) : null;
+    if (!baseDict && !regional) return { locale: 'en', dict: {}, base: english };
+    return { locale: regional ? want : base, dict: { ...(baseDict || {}), ...(regional || {}) }, base: english };
+  }
+  try { window.neo.i18n = loadLocale(); } catch { /* English it is */ }
+
+  // iOS puts a shortcuts bar (bold, italic, mic, ⌘ hints) above its keyboard;
+  // it covers Pocket's own bar, and NEO has its own idea of formatting
+  // the keyboard's colour follows the page theme (body.night comes and goes
+  // as the writer switches Night and Paper)
+  if (isIOS()) {
+    const tellKeyboard = () => { try { libraryHome().setKeyboard({ dark: document.body.classList.contains('night') }); } catch { /* fine */ } };
+    document.addEventListener('DOMContentLoaded', () => {
+      tellKeyboard();
+      new MutationObserver(tellKeyboard).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    });
+  }
+
+  // The keyboard's height becomes a CSS variable, and Pocket's own bar and
+  // panes sit above it (pocket.css). iOS is told nothing about resizing;
+  // its own attempts left a black band behind when the keyboard went away.
+  // Android shrinks the window for its keyboard by itself, so there the
+  // variable stays 0: lifting the page again left a keyboard-sized gap (#142).
+  document.addEventListener('DOMContentLoaded', () => {
+    if (!isIOS()) return;
+    try {
+      const K = window.Capacitor.Plugins.Keyboard;
+      if (!K) return;
+      const setKb = (h) => document.documentElement.style.setProperty('--kb', Math.max(0, h || 0) + 'px');
+      K.addListener('keyboardWillShow', (info) => setKb(info && info.keyboardHeight));
+      K.addListener('keyboardWillHide', () => setKb(0));
+    } catch { /* not on this platform */ }
+  });
+
   // Pocket is written on a real keyboard, so Android's on-screen one stays
   // down: every editable field gets inputmode="none", which keeps the caret
   // and hardware typing but never summons the soft keyboard. Long-press the
@@ -313,6 +420,7 @@
     });
   }
   window.pocketToggleSoftKeyboard = () => {
+    if (isIOS()) return true; // iOS decides for itself: on screen when no keyboard is attached
     softKeyboard = !softKeyboard;
     try { localStorage.setItem('pocket-soft-keyboard', softKeyboard ? 'on' : 'off'); } catch { /* fine */ }
     applyKeyboardMode(document);

@@ -118,6 +118,11 @@ function setUiLanguage(code) {
   const settings = readSettings();
   settings.uiLanguage = uiLanguage;
   writeSettings(settings);
+  // no dictionary picked yet: spellcheck moves with the interface
+  if (!SPELL_LANGUAGES[chosenSpellLanguage()] && defaultSpellLanguage() !== spellLanguage) {
+    spellLanguage = defaultSpellLanguage();
+    loadSpellDictionary(spellLanguage);
+  }
   try { buildMenu(); } catch (err) { logError('menu', err); }
   sendToWindow({ type: 'uiLanguage', value: uiLanguage });
 }
@@ -177,10 +182,18 @@ function ensureLibrary() {
   }
 }
 
+// Every book, chapter and sidecar name the page sends is one plain name
+// inside the library: ".", ".." and path separators never reach the disk.
+// Any name NEO ever made passes, and so does a folder named by hand.
+function libName(name) {
+  if (typeof name !== 'string' || !name || name === '.' || name === '..' || /[\\/\0]/.test(name)) {
+    throw new Error('Invalid library name');
+  }
+  return name;
+}
+
 function bookDir(bookId) {
-  const safeId = path.basename(String(bookId));
-  if (!safeId || safeId !== bookId) throw new Error('Invalid bookId');
-  return path.join(LIBRARY_DIR, safeId);
+  return path.join(LIBRARY_DIR, libName(bookId));
 }
 
 // A human-readable map of the library, regenerated on every change:
@@ -279,7 +292,7 @@ ipcMain.handle('library:listBooks', () => {
     for (const d of fs.readdirSync(LIBRARY_DIR)) {
       if (!d.startsWith('book-')) continue;
       const m = readJSON(path.join(LIBRARY_DIR, d, 'book.json'), null);
-      if (m && m.id) out.push({ id: m.id, title: m.title || t('Untitled'), author: m.author || '', modified: m.modified || '' });
+      if (m && m.id) out.push({ id: m.id, title: m.title || t('Untitled'), author: m.author || '', modified: m.modified || '', kind: m.kind || '' });
     }
   } catch (err) { logError('listBooks', err); }
   return out;
@@ -296,8 +309,27 @@ ipcMain.handle('book:writeMeta', (_e, bookId, meta) => {
   return meta.modified;
 });
 
+// {chapterId: mtime and size} for a book's chapter files — how refreshFromDisk
+// tells what changed without re-reading every chapter. The size is there
+// because sync tools hand over the other device's mtime, and on disks that
+// keep whole seconds two saves a second apart would otherwise look the same.
+ipcMain.handle('chapter:stamps', (_e, bookId) => {
+  const out = {};
+  try {
+    const dir = path.join(bookDir(bookId), 'chapters');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.html')) continue;
+      try {
+        const st = fs.statSync(path.join(dir, f));
+        out[f.slice(0, -5)] = st.mtimeMs + ':' + st.size;
+      } catch { /* vanished */ }
+    }
+  } catch { /* no chapters folder yet */ }
+  return out;
+});
+
 ipcMain.handle('chapter:read', (_e, bookId, chapterId) => {
-  const file = path.join(bookDir(bookId), 'chapters', chapterId + '.html');
+  const file = path.join(bookDir(bookId), 'chapters', libName(chapterId) + '.html');
   try {
     return fs.readFileSync(file, 'utf8');
   } catch {
@@ -307,20 +339,21 @@ ipcMain.handle('chapter:read', (_e, bookId, chapterId) => {
 
 ipcMain.handle('chapter:write', (_e, bookId, chapterId, html) => {
   const dir = path.join(bookDir(bookId), 'chapters');
+  const file = path.join(dir, libName(chapterId) + '.html');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, chapterId + '.html'), html);
+  fs.writeFileSync(file, html);
   return true;
 });
 
 ipcMain.handle('chapter:delete', (_e, bookId, chapterId) => {
-  const file = path.join(bookDir(bookId), 'chapters', chapterId + '.html');
+  const file = path.join(bookDir(bookId), 'chapters', libName(chapterId) + '.html');
   if (fs.existsSync(file)) fs.unlinkSync(file);
   return true;
 });
 
 ipcMain.handle('aux:read', (_e, bookId, name) => {
   // name: 'notes' | 'outline'
-  const file = path.join(bookDir(bookId), name + '.html');
+  const file = path.join(bookDir(bookId), libName(name) + '.html');
   try {
     return fs.readFileSync(file, 'utf8');
   } catch {
@@ -329,16 +362,16 @@ ipcMain.handle('aux:read', (_e, bookId, name) => {
 });
 
 ipcMain.handle('aux:write', (_e, bookId, name, html) => {
-  fs.writeFileSync(path.join(bookDir(bookId), name + '.html'), html);
+  fs.writeFileSync(path.join(bookDir(bookId), libName(name) + '.html'), html);
   return true;
 });
 
 ipcMain.handle('json:read', (_e, bookId, name, fallback) => {
-  return readJSON(path.join(bookDir(bookId), name + '.json'), fallback);
+  return readJSON(path.join(bookDir(bookId), libName(name) + '.json'), fallback);
 });
 
 ipcMain.handle('json:write', (_e, bookId, name, data) => {
-  writeJSON(path.join(bookDir(bookId), name + '.json'), data);
+  writeJSON(path.join(bookDir(bookId), libName(name) + '.json'), data);
   return true;
 });
 
@@ -540,18 +573,91 @@ ipcMain.handle('fullscreen:escape', (e) => {
 // ---------------------------------------------------------------------------
 
 async function renderPDF(html) {
+  // The book reaches the PDF printer as a file, not as a data: URL. A URL
+  // stops at 2 MB, and a long novel is bigger than that once it's encoded; a
+  // book in Russian or Chinese gets there far sooner, because every letter
+  // becomes six to nine characters. Past that the export (and ⌘E) saved
+  // nothing at all.
+  const tmp = path.join(app.getPath('temp'), `neo-print-${process.pid}-${Date.now()}.html`);
+  fs.writeFileSync(tmp, html, 'utf8');
   const pdfWin = new BrowserWindow({ show: false, webPreferences: { sandbox: true } });
   // Letter is a North American habit; most of the world prints A4.
   const letterCountries = ['US', 'CA', 'MX', 'PH'];
+  const options = {
+    pageSize: letterCountries.includes(app.getLocaleCountryCode()) ? 'Letter' : 'A4',
+    margins: { top: 1, bottom: 1, left: 1, right: 1 },
+    printBackground: false,
+    // chapter headings become the PDF's bookmarks, for jumping around in
+    // Preview or Acrobat, and the text is tagged for screen readers
+    generateTaggedPDF: true,
+    generateDocumentOutline: true
+  };
   try {
-    await pdfWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
-    return await pdfWin.webContents.printToPDF({
-      pageSize: letterCountries.includes(app.getLocaleCountryCode()) ? 'Letter' : 'A4',
-      margins: { top: 1, bottom: 1, left: 1, right: 1 },
-      printBackground: false
-    });
+    await pdfWin.loadFile(tmp);
+    let pdf = await pdfWin.webContents.printToPDF(options);
+    // A book's contents page can't know its page numbers until the book has
+    // been printed once: read where each entry landed from that printing,
+    // write the numbers in, and print again. Each number has a fixed width
+    // on the page, so nothing moves between the two printings.
+    if (html.includes('class="toc-pg"')) {
+      const pages = pdfAnchorPages(pdf);
+      if (Object.keys(pages).length) {
+        await pdfWin.webContents.executeJavaScript(`(() => {
+          const pages = ${JSON.stringify(pages)};
+          for (const el of document.querySelectorAll('.toc-pg')) el.textContent = pages[el.dataset.for] || '';
+        })()`);
+        pdf = await pdfWin.webContents.printToPDF(options);
+      }
+    }
+    return pdf;
   } finally {
     pdfWin.destroy();
+    try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+  }
+}
+
+// The page each link target starts on (1 for the first page), read from a
+// PDF Chromium just printed. Skia writes the file's objects as plain text
+// (only page contents are compressed) and lists every linked-to anchor in
+// the catalog's /Dests, so the cross-reference table leads straight to them.
+// Anything laid out otherwise gives {}, and the contents go without numbers.
+function pdfAnchorPages(buf) {
+  try {
+    const s = buf.toString('latin1');
+    const sx = s.lastIndexOf('startxref');
+    const xref = parseInt(s.slice(sx + 9, sx + 40).trim(), 10);
+    const head = /^xref\s+(\d+)\s+(\d+)\s*?[\r\n]+/.exec(s.slice(xref, xref + 64));
+    const root = /\/Root (\d+) 0 R/.exec(s.slice(Math.max(0, sx - 4000), sx));
+    if (!head || !root) return {};
+    const first = +head[1];
+    const count = +head[2];
+    const table = xref + head[0].length;
+    const obj = (n) => {
+      if (n - first < 0 || n - first >= count) return '';
+      const at = parseInt(s.substr(table + (n - first) * 20, 10), 10);
+      return s.slice(at, s.indexOf('endobj', at));
+    };
+    const catalog = obj(+root[1]);
+    const pagesRef = /\/Pages (\d+) 0 R/.exec(catalog);
+    const destsRef = /\/Dests (\d+) 0 R/.exec(catalog);
+    if (!pagesRef || !destsRef) return {};
+    const order = [];
+    const walk = (n, depth) => {
+      const o = obj(n);
+      const kids = /\/Kids\s*\[([^\]]*)\]/.exec(o);
+      if (/\/Type\s*\/Pages\b/.test(o) && kids && depth < 32) {
+        for (const k of kids[1].matchAll(/(\d+) 0 R/g)) walk(+k[1], depth + 1);
+      } else order.push(n);
+    };
+    walk(+pagesRef[1], 0);
+    const index = new Map(order.map((n, i) => [n, i + 1]));
+    const out = {};
+    for (const m of obj(+destsRef[1]).matchAll(/\/([A-Za-z0-9_.-]+)\s*\[\s*(\d+) 0 R/g)) {
+      if (index.has(+m[2])) out[m[1]] = index.get(+m[2]);
+    }
+    return out;
+  } catch {
+    return {};
   }
 }
 
@@ -578,12 +684,20 @@ ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntr
     filters: [{ name: format.toUpperCase(), extensions: [format] }]
   });
   if (canceled || !filePath) return null;
-  if (zipEntries) {
-    fs.writeFileSync(filePath, await buildZip(zipEntries));
-  } else if (format === 'pdf') {
-    fs.writeFileSync(filePath, await renderPDF(content));
-  } else {
-    fs.writeFileSync(filePath, content, 'utf8');
+  try {
+    if (zipEntries) {
+      fs.writeFileSync(filePath, await buildZip(zipEntries));
+    } else if (format === 'pdf') {
+      fs.writeFileSync(filePath, await renderPDF(content));
+    } else {
+      fs.writeFileSync(filePath, content, 'utf8');
+    }
+  } catch (err) {
+    // Main-process export failures used to vanish: the renderer saw a bare
+    // rejection and nothing reached neo-errors.log. Log it here, and hand the
+    // renderer a sentence it can show the writer.
+    logError('export save', err);
+    throw new Error('Could not write the file (' + ((err && err.message) || err) + ')');
   }
   return filePath;
 });
@@ -729,8 +843,16 @@ const CHAPTER_WORDS = new RegExp('^(' + [
   'capitolo',                                                      // it
   'kapitel', 'prolog', 'epilog', 'teil',                           // de
   'hoofdstuk', 'proloog', 'epiloog', 'deel',                       // nl
-  'rozdział', 'rozdzial', 'część', 'czesc'                          // pl
+  'rozdział', 'rozdzial', 'część', 'czesc',                         // pl
+  // ro (prolog, epilog above). A bare "Capitol" only before a number:
+  // on its own it is an English word, and "Capitol Hill was quiet." is prose
+  'capitol(?=\\s+\\d)', 'capitolul', 'partea',
+  'глава', 'пролог', 'эпилог', 'часть'                             // ru
 ].join('|') + ')(?![\\p{L}\\d])', 'iu');
+
+// A manuscript's own Prologue / Epilogue headings give those chapters their role
+const PROLOGUE_WORDS = /^(prologue|prólogo|prologo|prolog|proloog)(?![\p{L}\d])/iu;
+const EPILOGUE_WORDS = /^(epilogue|épilogue|epílogo|epilogo|epilog|epiloog)(?![\p{L}\d])/iu;
 
 async function importFile(fp) {
   const name = path.basename(fp).replace(/\.[^.]+$/, '');
@@ -766,9 +888,12 @@ async function importFile(fp) {
   const isMdHeading = (t) => /^#{1,6}\s+\S/.test(t);
   const mdTitleOf = (t) => t.replace(/^#{1,6}\s*/, '').trim();
   // A heading that is purely NEO's own numbering ("Chapter 2", "Prologue",
-  // bare "7") carries no title — NEO numbers chapters itself.
+  // bare "7") carries no title — NEO numbers chapters itself. A line that
+  // only opens with one of those words and reads as a sentence ("Part of me
+  // wanted to run.", "Часть денег пропала.") is prose: it stays in the text.
+  const readsAsSentence = (t) => /[.!?…][”’"'»)]*$/.test(t) && t.trim().split(/\s+/).length > 2;
   const isNumberedHeading = (t) => (
-    (CHAPTER_WORDS.test(t) && t.length < 60) ||
+    (CHAPTER_WORDS.test(t) && t.length < 60 && !readsAsSentence(t)) ||
     (numeralMode && isNumeralish(t))
   );
   const isHeading = (t) => t && (isMdHeading(t) || isNumberedHeading(t));
@@ -786,13 +911,15 @@ async function importFile(fp) {
     const chapters = [];
     let cur = [];
     let curTitle = '';
+    let curRole = null;
     let seenProse = false;
     let lastWasHeading = false;
     styledTitle = null;
     const close = () => {
-      if (cur.length) chapters.push({ title: curTitle, paras: cur });
+      if (cur.length) chapters.push({ title: curTitle, paras: cur, role: curRole });
       cur = [];
       curTitle = '';
+      curRole = null;
     };
     for (const p of paras) {
       const brk = usePageBreaks && p.pageBreak;
@@ -811,7 +938,11 @@ async function importFile(fp) {
         }
         close();
       }
-      if (isH) { curTitle = titleOf(p.text || ''); lastWasHeading = true; continue; } // the heading line is replaced by NEO's numbering
+      if (isH) {
+        const h = (p.text || '').replace(/^#{1,6}\s*/, '').trim();
+        curRole = PROLOGUE_WORDS.test(h) ? 'prologue' : EPILOGUE_WORDS.test(h) ? 'epilogue' : null;
+        curTitle = titleOf(p.text || ''); lastWasHeading = true; continue;
+      } // the heading line is replaced by NEO's numbering
       lastWasHeading = false;
       if (isBreak(p.text)) { cur.push({ scene: true }); continue; }
       if (p.text) { cur.push({ text: p.text }); seenProse = true; }
@@ -836,7 +967,9 @@ async function importFile(fp) {
   // title page, not in the body. Detect, harvest, and remove them.
   let title = styledTitle || null;
   let author = null;
-  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  // letters of any script; NFC because a Mac may hand over the file name
+  // decomposed while the text inside is composed
+  const norm = (s) => s.normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
   // "by Jane Doe" — or its equivalent in another language. Those words also
   // open ordinary sentences ("Par une nuit…", "Von Anfang an"), so outside
   // English the rest must look like a name: capitalized words (name
@@ -844,7 +977,9 @@ async function importFile(fp) {
   const bylineOf = (s) => {
     const en = s.match(/^by\s+(.{2,60})$/i);
     if (en) return en[1];
-    const m = s.match(/^(?:par|por|von|di|door|autor:?)\s+(.{2,60})$/iu);
+    // Romanian "de Ion Creangă" is lowercase on a title page; a capital "De"
+    // opens titles ("De Profundis", Dutch "De Eerste Dag") and stays text
+    const m = s.match(/^(?:par|por|von|di|door|autor:?|автор:?)\s+(.{2,60})$/iu) || s.match(/^de\s+(.{2,60})$/u);
     if (!m || /[.!?,;…]/.test(m[1])) return null;
     const words = m[1].trim().split(/\s+/);
     const particle = /^(de|da|di|do|dos|das|du|des|del|della|la|le|van|von|der|den|ten|ter|y|e)$/;
@@ -857,7 +992,7 @@ async function importFile(fp) {
     const titleish = t0 && t0.length < 90 && !/[.!?]$/.test(t0) && (
       (norm(t0).length > 3 && norm(name).includes(norm(t0))) ||
       !!bylineOf(t1) ||
-      (t0 === t0.toUpperCase() && /[A-Z].*[A-Z]/.test(t0) && t0.length < 60)
+      (t0 === t0.toUpperCase() && /\p{Lu}.*\p{Lu}/u.test(t0) && t0.length < 60)
     );
     if (titleish) {
       title = t0;
@@ -872,6 +1007,10 @@ async function importFile(fp) {
     if (!chapters.length) chapters.push({ title: '', paras: [{ text: '' }] });
   }
 
+  // a role only holds in its place: the prologue first, the epilogue last
+  chapters.forEach((ch, i) => {
+    if ((ch.role === 'prologue' && i !== 0) || (ch.role === 'epilogue' && i !== chapters.length - 1) || chapters.length < 2) ch.role = null;
+  });
   return { name, title, author, chapters };
 }
 
@@ -940,17 +1079,32 @@ async function dailyBackup() {
     const JSZip = require('jszip');
     const zip = new JSZip();
     const skip = new Set(['Backups', 'Exports']);
+    // One file the system won't hand over (in iCloud but not downloaded yet,
+    // held by a sync tool) used to throw, and cost the whole day's backup,
+    // every day. Now it's left out, named in the zip and in the error log.
+    const missed = [];
     const walk = (dir, rel) => {
-      for (const name of fs.readdirSync(dir)) {
+      let names = [];
+      try { names = fs.readdirSync(dir); } catch (err) { missed.push(`${rel || '.'} (${err.code || err.message})`); return; }
+      for (const name of names) {
         if (rel === '' && skip.has(name)) continue;
+        if (name === '.DS_Store' || /^\..+\.icloud$/.test(name)) continue; // Finder litter; iCloud's stand-in for a file not downloaded
         const full = path.join(dir, name);
         const relPath = rel ? rel + '/' + name : name;
-        const stat = fs.statSync(full);
-        if (stat.isDirectory()) walk(full, relPath);
-        else zip.file(relPath, fs.readFileSync(full));
+        try {
+          const stat = fs.statSync(full);
+          if (stat.isDirectory()) walk(full, relPath);
+          else zip.file(relPath, fs.readFileSync(full));
+        } catch (err) {
+          missed.push(`${relPath} (${err.code || err.message})`);
+        }
       }
     };
     walk(LIBRARY_DIR, '');
+    if (missed.length) {
+      zip.file('_left-out-of-this-backup.txt', missed.join('\n') + '\n');
+      logError('backup', new Error('left out of today\'s backup: ' + missed.join(', ')));
+    }
     fs.writeFileSync(target, await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
 
     // prune old backups
@@ -963,6 +1117,13 @@ async function dailyBackup() {
 
 // ---------------------------------------------------------------------------
 // Window
+// The window's own color, seen for a moment before the page draws and at the
+// edges while it resizes: the room's color, dark or (View → Page → Light) light
+function roomColor(theme) { return theme === 'light' ? '#efede8' : '#191919'; }
+function libraryPageTheme() {
+  try { return JSON.parse(fs.readFileSync(LIBRARY_FILE, 'utf8')).pageTheme || 'night'; } catch { return 'night'; }
+}
+
 // ---------------------------------------------------------------------------
 function createWindow() {
   // the window comes back the size and place it was left, when that place
@@ -985,7 +1146,7 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     titleBarStyle: 'hiddenInset',
-    backgroundColor: '#191919',
+    backgroundColor: roomColor(libraryPageTheme()),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -997,6 +1158,20 @@ function createWindow() {
     }
   });
   win.loadFile('index.html');
+  // The menu bar follows the real full-screen state, whoever changed it.
+  // Electron only puts the bar back after a full screen it entered itself,
+  // so once a window manager's own full-screen key had been used (Sway, i3),
+  // NEO's toggle left the bar hidden for good. Run a tick later, after
+  // Electron's own show/hide, so this has the last word.
+  const fullScreenChanged = (full) => setImmediate(() => {
+    if (win.isDestroyed()) return;
+    win.webContents.send('menu', { type: 'fullScreen', value: full }); // the page's bottom bar too
+    if (process.platform === 'darwin') return;
+    win.setMenuBarVisibility(!full && !win.isMenuBarAutoHide());
+  });
+  win.on('enter-full-screen', () => fullScreenChanged(true));
+  win.on('leave-full-screen', () => fullScreenChanged(false));
+  win.webContents.on('did-finish-load', () => { if (win.isFullScreen()) fullScreenChanged(true); });
   const remember = () => {
     if (win.isDestroyed() || win.isFullScreen() || win.isMinimized()) return;
     writeSettings({ ...readSettings(), window: win.getNormalBounds() });
@@ -1004,6 +1179,22 @@ function createWindow() {
   win.on('resize', remember);
   win.on('move', remember);
   win.on('close', remember);
+
+  // Right-click on text: Cut, Copy, Paste, Select All. On a Mac, macOS adds
+  // Look Up, Writing Tools and Services on its own when the menu knows where
+  // the selection sits (the frame). NEO's own right-click menus (shelves,
+  // covers, chapter headings, flagged words) cancel the event first, so this
+  // never comes up over them.
+  win.webContents.on('context-menu', (_e, params) => {
+    if (!params.isEditable && !params.selectionText) return;
+    const can = params.editFlags || {};
+    const items = [];
+    if (params.isEditable) items.push({ role: 'cut', label: t('Cut'), enabled: !!can.canCut });
+    items.push({ role: 'copy', label: t('Copy'), enabled: !!can.canCopy });
+    if (params.isEditable) items.push({ role: 'paste', label: t('Paste'), enabled: !!can.canPaste });
+    items.push({ type: 'separator' }, { role: 'selectAll', label: t('Select All') });
+    Menu.buildFromTemplate(items).popup({ window: win, frame: params.frame });
+  });
 
   // NEO does its own spellchecking (see spell:* handlers) — the engine's
   // checker proved unreliable at scanning existing text, so it stays off
@@ -1028,7 +1219,9 @@ const SPELL_LANGUAGES = {
   'de': { label: 'Deutsch', pkg: 'dictionary-de' },
   'nl': { label: 'Nederlands', pkg: 'dictionary-nl' },
   'pl': { label: 'Polski', pkg: 'dictionary-pl' },
-  'pt-BR': { label: 'Português (Brasil)', trie: path.join(__dirname, 'dict', 'pt_BR.trie.gz') }
+  'pt-BR': { label: 'Português (Brasil)', trie: path.join(__dirname, 'dict', 'pt_BR.trie.gz') },
+  'ro': { label: 'Română', pkg: 'dictionary-ro' },
+  'ru': { label: 'Русский', pkg: 'dictionary-ru' }
 };
 
 // The dictionary work runs in a helper process (spell-worker.js): parsing
@@ -1075,18 +1268,35 @@ async function loadSpellDictionary(code) {
   let custom = [];
   try { custom = readJSON(LIBRARY_FILE, {}).customWords || []; } catch { /* a nicety */ }
   const dictionary = entry.trie
-    ? { type: 'load', locale: known, dictionaryPath: entry.trie, custom }
-    : { type: 'load', dir: path.join(__dirname, 'node_modules', entry.pkg), custom };
+    ? { type: 'load', language: known, dictionaryPath: entry.trie, custom }
+    : { type: 'load', language: known, dir: path.join(__dirname, 'node_modules', entry.pkg), custom };
   const res = await spellRequest(dictionary);
   if (!res.ok) { logError('spell', new Error(res.error || 'dictionary failed to load')); return false; }
   spellLanguage = known;
   return true;
 }
 
+// One rule for every language: a dictionary picked in Edit → Spellcheck
+// Language wins. Until there is one, spellcheck follows the interface
+// language when NEO has its dictionary (fr-CA → fr), else US English.
+// Nothing is saved on the writer's behalf, so switching the interface back
+// takes the dictionary (and the typed quotes) along with it.
+function chosenSpellLanguage() {
+  const saved = readJSON(LIBRARY_FILE, null);
+  return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved.spellLanguage : undefined;
+}
+
+function defaultSpellLanguage() {
+  const ui = String(uiLanguage || 'en');
+  if (SPELL_LANGUAGES[ui]) return ui;
+  const base = ui.split('-')[0];
+  return SPELL_LANGUAGES[base] ? base : 'en-US';
+}
+
 function initSpell() {
-  let code = 'en-US';
-  try { code = readJSON(LIBRARY_FILE, {}).spellLanguage || 'en-US'; } catch { /* fresh library */ }
-  loadSpellDictionary(code);
+  const chosen = chosenSpellLanguage();
+  spellLanguage = SPELL_LANGUAGES[chosen] ? chosen : defaultSpellLanguage();
+  loadSpellDictionary(spellLanguage);
 }
 
 ipcMain.handle('spell:setLanguage', async (_e, code) => {
@@ -1138,12 +1348,24 @@ ipcMain.on('typewriter:state', (_e, on) => {
   typewriterState = on;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
+// View → Interface Size shows its choice
+let uiZoomState = 1;
+ipcMain.on('uizoom:state', (_e, z) => {
+  z = [1, 1.25, 1.5, 2, 2.5, 3].includes(z) ? z : 1;
+  if (z === uiZoomState) return;
+  uiZoomState = z;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
 // View menu ticks: the focus level, the page, and Brighter Interface
 let viewState = { focus: 'off', pageTheme: 'night', uiBright: false };
-ipcMain.on('view:state', (_e, st) => {
+ipcMain.on('view:state', (e, st) => {
   st = st || {};
   const next = { focus: st.focus || 'off', pageTheme: st.pageTheme || 'night', uiBright: !!st.uiBright };
   if (JSON.stringify(next) === JSON.stringify(viewState)) return;
+  if (next.pageTheme !== viewState.pageTheme) {
+    const w = BrowserWindow.fromWebContents(e.sender);
+    if (w && !w.isDestroyed()) w.setBackgroundColor(roomColor(next.pageTheme));
+  }
   viewState = next;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
@@ -1163,10 +1385,10 @@ function buildMenu() {
   // them, so the menu names the faces bundled in fonts/ (see styles.css).
   // The Windows list stays the one the renderer already understands.
   const bodyFonts = isMac
-    ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style']
+    ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost']
     : isWin
-      ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia']
-      : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro'];
+      ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost']
+      : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro', 'Jost'];
   const template = [
     // appMenu exists only on macOS — including it on Windows throws,
     // which is exactly what kept NEO from ever opening a window there
@@ -1352,11 +1574,17 @@ function buildMenu() {
           ]
         },
         { type: 'separator' },
+        // the next or previous chapter, without opening the pane
+        { label: t('Next Chapter'), accelerator: 'Alt+CmdOrCtrl+Down', click: () => sendToWindow({ type: 'chapterStep', value: 1 }) },
+        { label: t('Previous Chapter'), accelerator: 'Alt+CmdOrCtrl+Up', click: () => sendToWindow({ type: 'chapterStep', value: -1 }) },
+        { type: 'separator' },
         {
           label: t('Page'),
           submenu: [
-            { label: t('Night'), type: 'radio', checked: viewState.pageTheme !== 'paper', click: () => sendToWindow({ type: 'pageTheme', value: 'night' }) },
-            { label: t('Paper'), type: 'radio', checked: viewState.pageTheme === 'paper', click: () => sendToWindow({ type: 'pageTheme', value: 'paper' }) }
+            { label: t('Night'), type: 'radio', checked: viewState.pageTheme !== 'paper' && viewState.pageTheme !== 'light', click: () => sendToWindow({ type: 'pageTheme', value: 'night' }) },
+            { label: t('Paper'), type: 'radio', checked: viewState.pageTheme === 'paper', click: () => sendToWindow({ type: 'pageTheme', value: 'paper' }) },
+            // white paper in a light room: the whole app, shelf included
+            { label: t('Light'), type: 'radio', checked: viewState.pageTheme === 'light', click: () => sendToWindow({ type: 'pageTheme', value: 'light' }) }
           ]
         },
         {
@@ -1364,6 +1592,16 @@ function buildMenu() {
           type: 'checkbox',
           checked: viewState.uiBright,
           click: () => sendToWindow({ type: 'uiBright' })
+        },
+        {
+          label: t('Interface Size'),
+          // as far as the page zoom goes: 300%
+          submenu: [1, 1.25, 1.5, 2, 2.5, 3].map((z) => ({
+            label: z === 1 ? t('Normal') : new Intl.NumberFormat(uiLanguage || 'en', { style: 'percent' }).format(z),
+            type: 'radio',
+            checked: uiZoomState === z,
+            click: () => sendToWindow({ type: 'uiZoom', value: z })
+          }))
         },
         { type: 'separator' },
         {

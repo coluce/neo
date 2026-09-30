@@ -19,6 +19,8 @@ function applyStaticI18n(root = document) {
   root.querySelectorAll('[data-i18n-title]').forEach((el) => { if (el.title) el.title = t(el.title); });
   root.querySelectorAll('[data-i18n-placeholder]').forEach((el) => { el.placeholder = t(el.placeholder); });
   root.querySelectorAll('[data-i18n-ph]').forEach((el) => { el.dataset.ph = t(el.dataset.ph); });
+  // names for screen readers, where a symbol or a placeholder is all the eye gets
+  root.querySelectorAll('[data-i18n-label]').forEach((el) => { el.setAttribute('aria-label', t(el.dataset.i18nLabel)); });
   // hints that styles.css draws with ::before read these custom properties
   const cssHints = {
     '--ph-add-title': t('add a title'),
@@ -46,6 +48,99 @@ const tabName = (kind) => {
   return n === 'Notes' || n === 'Outline' ? t(n) : n;
 };
 
+// What each entry in the Chapters pane is. Every entry is a chapter unless
+// the writer makes it something else (right-click its box, or add one with
+// the faint + between boxes): a page a published book carries, a part, a
+// prologue or an epilogue. book.chapterKinds holds the ones that aren't
+// chapters. Chapters are numbered; parts are numbered on their own; the rest
+// go by their names. Prologues, epilogues and chapters are the story: they
+// count toward the words.
+const CHAPTER_KINDS = ['copyright', 'dedication', 'epigraph', 'contents', 'prologue', 'part', 'chapter', 'epilogue', 'acknowledgments', 'about'];
+const STORY_KINDS = ['chapter', 'prologue', 'epilogue'];
+// what comes after the story, where a new chapter never goes
+const BACK_KINDS = ['epilogue', 'acknowledgments', 'about'];
+function chapterKind(chId, meta = book) {
+  const k = meta && meta.chapterKinds && meta.chapterKinds[chId];
+  if (k && CHAPTER_KINDS.includes(k)) return k;
+  // NEO 1.0 kept a prologue and an epilogue as roles of the first and last
+  // chapters (a book not opened since reads that way until it is)
+  const order = (meta && meta.chapterOrder) || [];
+  if (order.length >= 2) {
+    if (meta.prologue === chId && order[0] === chId) return 'prologue';
+    if (meta.epilogue === chId && order[order.length - 1] === chId) return 'epilogue';
+  }
+  return 'chapter';
+}
+const isStory = (chId, meta = book) => STORY_KINDS.includes(chapterKind(chId, meta));
+// a prologue or an epilogue: story that stands outside the numbering
+function chapterRole(chId, meta = book) {
+  const k = chapterKind(chId, meta);
+  return k === 'prologue' || k === 'epilogue' ? k : null;
+}
+// a chapter's number counts chapters only; a part's, parts only
+function kindCount(chId, kind, meta = book) {
+  let n = 0;
+  for (const c of meta.chapterOrder) {
+    if (chapterKind(c, meta) === kind) n++;
+    if (c === chId) break;
+  }
+  return n;
+}
+const chapterNumber = (chId, meta = book) => kindCount(chId, 'chapter', meta);
+function chapterName(chId, meta = book) {
+  const k = chapterKind(chId, meta);
+  if (k === 'chapter') return t('Chapter {n}', { n: chapterNumber(chId, meta) });
+  if (k === 'part') return partLabel(kindCount(chId, 'part', meta));
+  return kindName(k);
+}
+function kindName(kind) {
+  if (kind === 'chapter') return t('Chapter');
+  if (kind === 'contents') return t('Contents');
+  return pageKindName(kind);
+}
+// where there's only room for a number: a chapter's, a part's in roman
+// numerals, and a fleuron for the rest
+function chapterMark(chId, meta = book) {
+  const k = chapterKind(chId, meta);
+  if (k === 'chapter') return String(chapterNumber(chId, meta));
+  if (k === 'part') return roman(kindCount(chId, 'part', meta));
+  return '❦';
+}
+// how many numbered chapters the book has
+const numberedChapters = (meta = book) => meta.chapterOrder.filter((c) => chapterKind(c, meta) === 'chapter').length;
+// A story of one chapter is just "the story": no heading, no number, until a
+// second chapter (or a prologue, an epilogue or a part) joins it. The pages
+// around it don't count.
+function soloStory(meta = book) {
+  const story = meta.chapterOrder.filter((c) => isStory(c, meta) || chapterKind(c, meta) === 'part');
+  return story.length === 1 && chapterKind(story[0], meta) === 'chapter' ? story[0] : null;
+}
+// NEO 1.0's roles become kinds the first time a book opens here, and a kind
+// whose entry is gone is let go
+function settleChapterKinds() {
+  let changed = false;
+  for (const role of ['prologue', 'epilogue']) {
+    if (!(role in book)) continue;
+    const id = book[role];
+    if (chapterKind(id) === role) (book.chapterKinds = book.chapterKinds || {})[id] = role;
+    delete book[role];
+    changed = true;
+  }
+  for (const id of Object.keys(book.chapterKinds || {})) {
+    const k = book.chapterKinds[id];
+    if (!book.chapterOrder.includes(id) || k === 'chapter' || !CHAPTER_KINDS.includes(k)) {
+      delete book.chapterKinds[id];
+      changed = true;
+    }
+  }
+  if (changed) scheduleMetaSave();
+}
+function setChapterKind(chId, kind) {
+  book.chapterKinds = book.chapterKinds || {};
+  if (kind === 'chapter') delete book.chapterKinds[chId];
+  else book.chapterKinds[chId] = kind;
+}
+
 const isUntitled = (s) => !s || s === 'Untitled' || s === t('Untitled');
 
 // ---------- state ----------
@@ -54,6 +149,8 @@ let book = null;             // current book.json
 let chapterHTML = {};        // chapterId -> html (loaded at open)
 let savedHTML = {};          // chapterId -> html as last read from / written to disk
 let savedMetaSig = '';       // book.json as last read/written, minus the volatile bits
+let diskStamps = {};         // chapterId -> file mtime as of the last look at the disk
+let writing = {};            // chapterId -> chapter writes still on their way to disk
 let stickies = [];           // [{id, chapterId, text, resolved}]
 let darlings = [];           // [{id, html, text, chapterId, chapterLabel, date}]
 let currentTab = 'manuscript';
@@ -61,11 +158,74 @@ let currentChapterId = null; // chapter the caret/scroll is in
 let wordMode = 'book';       // 'book' | 'chapter'
 let saveTimers = {};
 
+// Every library.json write from this window goes through here. A look at the
+// disk (refreshFromDisk) can then tell its own writes from another device's:
+// a read that a write here crossed, or that finished while one was still on
+// its way, is older than the library in memory and must not replace it.
+let libraryGeneration = 0;
+let libraryWritesPending = 0;
+function writeLibrary(lib = library) {
+  libraryGeneration++;
+  libraryWritesPending++;
+  return new Promise((resolve) => resolve(window.neo.writeLibrary(lib)))
+    .finally(() => { libraryWritesPending--; });
+}
+
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 // Platform-aware key labels: Macs read ⌘⇧X, everyone else reads Ctrl+Shift+X
 const IS_MAC = navigator.platform.toLowerCase().includes('mac');
+// a touch screen (Pocket): nothing to hover, no right button
+const NO_HOVER = !!(window.matchMedia && window.matchMedia('(hover: none)').matches) || !!window.Capacitor;
+
+// Touch has no right-click: a long press on a book, a shelf name or a chapter
+// heading opens the same menu. Not inside the text itself — there a long
+// press belongs to the system's own selection handles.
+(() => {
+  let timer = null;
+  let start = null;
+  let swallowClick = false;
+  let armed = false; // held long enough; the menu opens when the finger lifts
+  document.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    const target = e.target;
+    if (!target.closest) return;
+    // shelf names are editable on tap, but a long press on one is a menu
+    if (target.closest('[contenteditable="true"], input, textarea')) return;
+    if (target.closest('#pocket-chapters')) return;
+    const p = e.touches[0];
+    start = { x: p.clientX, y: p.clientY, target };
+    armed = false;
+    clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; armed = true; }, 550);
+  }, { passive: true });
+  const cancel = () => { clearTimeout(timer); timer = null; armed = false; };
+  document.addEventListener('touchmove', (e) => {
+    if (!start) return;
+    const p = e.touches[0];
+    if (Math.hypot(p.clientX - start.x, p.clientY - start.y) > 10) cancel();
+  }, { passive: true });
+  document.addEventListener('touchend', () => {
+    if (armed && start) {
+      // iOS usually sends no click after a long press; when it does, it
+      // comes at once — so the guard lifts itself before the menu's first tap
+      swallowClick = true;
+      setTimeout(() => { swallowClick = false; }, 300);
+      const { target, x, y } = start;
+      setTimeout(() => target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: x, clientY: y })), 30);
+    }
+    cancel();
+  }, { passive: true });
+  document.addEventListener('touchcancel', cancel, { passive: true });
+  // the tap that ends a long press must not also open the book
+  document.addEventListener('click', (e) => {
+    if (!swallowClick) return;
+    swallowClick = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+})();
 const K = (mac, pc) => (IS_MAC ? mac : pc);
 const KZ = K('⌘Z', 'Ctrl+Z');
 const KPH = K('⌘⇧X', 'Ctrl+Shift+X');
@@ -116,8 +276,8 @@ function optionModal(title, message, options) {
     const bd = document.createElement('div');
     bd.className = 'modal-backdrop';
     const buttons = options.map((o, i) =>
-      `<button class="fr-choice" data-i="${i}" style="width:100%;margin-bottom:8px;${o.danger ? 'border-color:#6b3a34' : ''}">
-        <strong${o.danger ? ' style="color:#d97b6c"' : ''}>${o.label}</strong>
+      `<button class="fr-choice${o.danger ? ' danger' : ''}" data-i="${i}" style="width:100%;margin-bottom:8px">
+        <strong>${o.label}</strong>
         ${o.desc ? `<span>${o.desc}</span>` : ''}
       </button>`).join('');
     bd.innerHTML = `
@@ -139,6 +299,97 @@ function optionModal(title, message, options) {
   });
 }
 
+// A small menu at the pointer, the way a right-click menu opens: items are
+// {label, value, checked, disabled, danger} or '-' for a line between them.
+// Resolves to the chosen value, or null. Arrow keys, Enter and Esc work.
+function popMenu(x, y, items, { title = '', from = null } = {}) {
+  if (popMenu.close) popMenu.close(); // one at a time
+  return new Promise((resolve) => {
+    const menu = document.createElement('div');
+    menu.className = 'pop-menu';
+    menu.setAttribute('role', 'menu');
+    if (title) {
+      const h = document.createElement('div');
+      h.className = 'pm-title';
+      h.textContent = title;
+      menu.setAttribute('aria-label', title);
+      menu.appendChild(h);
+    }
+    for (const it of items) {
+      if (it === '-') {
+        const sep = document.createElement('div');
+        sep.className = 'pm-sep';
+        menu.appendChild(sep);
+        continue;
+      }
+      const b = document.createElement('button');
+      b.setAttribute('role', it.checked !== undefined ? 'menuitemradio' : 'menuitem');
+      if (it.checked !== undefined) b.setAttribute('aria-checked', it.checked ? 'true' : 'false');
+      b.className = (it.checked ? 'on' : '') + (it.danger ? ' danger' : '');
+      b.textContent = it.label;
+      b.disabled = !!it.disabled;
+      b.tabIndex = -1;
+      b.onclick = () => done(it.value);
+      b.onmouseenter = () => { if (!b.disabled) b.focus({ preventScroll: true }); };
+      menu.appendChild(b);
+    }
+    document.body.appendChild(menu);
+    // opened from the keyboard (no pointer), it hangs from the thing it's for
+    if ((!x && !y) && from) {
+      const r = from.getBoundingClientRect();
+      x = r.left + 12;
+      y = r.bottom;
+    }
+    const zoom = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ui-zoom')) || 1;
+    const w = menu.offsetWidth * zoom;
+    const h = menu.offsetHeight * zoom;
+    const left = Math.max(4, Math.min(x, window.innerWidth - w - 4));
+    const top = y + h > window.innerHeight - 4 ? Math.max(4, y - h) : y;
+    menu.style.left = left / zoom + 'px';
+    menu.style.top = top / zoom + 'px';
+    const back = document.activeElement;
+    const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
+    const done = (value) => {
+      if (!menu.isConnected) return;
+      menu.remove();
+      popMenu.close = null;
+      document.removeEventListener('mousedown', outside, true);
+      window.removeEventListener('blur', cancel);
+      // the Chapters pane it kept open closes if the pointer has left it
+      const nav = $('#nav-pane');
+      if (nav && nav.dataset.pinned !== '1' && !nav.matches(':hover')) nav.classList.remove('open');
+      if (value === null && back && back.isConnected && back.focus) back.focus({ preventScroll: true });
+      resolve(value);
+    };
+    const cancel = () => done(null);
+    popMenu.close = cancel;
+    const outside = (e) => { if (!menu.contains(e.target)) done(null); };
+    document.addEventListener('mousedown', outside, true);
+    window.addEventListener('blur', cancel);
+    menu.addEventListener('keydown', (e) => {
+      const at = buttons.indexOf(document.activeElement);
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(null); }
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const next = buttons[(at + (e.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length];
+        if (next) next.focus();
+      } else if (e.key === 'Tab') e.preventDefault();
+      e.stopPropagation();
+    });
+    (buttons.find((b) => b.classList.contains('on')) || buttons[0] || menu).focus({ preventScroll: true });
+  });
+}
+
+// A click (or tap) on the dim page around any dialog dismisses it the way
+// its own quiet button would — Cancel or Later where there is one, else
+// Done/OK. Dialogs that must be answered have neither and stay put.
+document.addEventListener('mousedown', (e) => {
+  const bd = e.target && e.target.classList && e.target.classList.contains('modal-backdrop') ? e.target : null;
+  if (!bd || bd.dataset.stay === '1') return;
+  const btn = bd.querySelector('.m-cancel') || bd.querySelector('.m-ok');
+  if (btn) btn.click();
+});
+
 function toast(msg, ms = 4000) {
   const h = $('#hint');
   h.textContent = msg;
@@ -147,9 +398,38 @@ function toast(msg, ms = 4000) {
   toast._t = setTimeout(() => { h.hidden = true; }, ms);
 }
 
+// Scripts that do not separate words with spaces: a whitespace count reports
+// one "word" for a whole sentence, so word goals and statistics read far too
+// low. Intl.Segmenter knows their boundaries; the same API already runs the
+// focus mode (see sentenceRange), and one segmenter is kept per script.
+const SEGMENTED_SCRIPTS = [
+  { lang: 'th', chars: /[\u0E00-\u0E7F]/ }, // Thai
+  { lang: 'lo', chars: /[\u0E80-\u0EFF]/ }, // Lao
+  { lang: 'my', chars: /[\u1000-\u109F]/ }, // Myanmar
+  { lang: 'km', chars: /[\u1780-\u17FF]/ }  // Khmer
+];
+let wordSegmenter = null;
+let wordSegmenterLang = '';
+
 // a word holds at least one letter or digit, so French « » and spaced
 // dashes are not counted as words
-const countWords = (text) => (text.trim().match(/\S+/g) || []).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+function countWords(text) {
+  const trimmed = text.trim();
+  if (trimmed === '') return 0;
+  if (window.Intl && Intl.Segmenter) {
+    const script = SEGMENTED_SCRIPTS.find((s) => s.chars.test(trimmed));
+    if (script) {
+      if (wordSegmenterLang !== script.lang) {
+        wordSegmenter = new Intl.Segmenter(script.lang, { granularity: 'word' });
+        wordSegmenterLang = script.lang;
+      }
+      let words = 0;
+      for (const part of wordSegmenter.segment(trimmed)) if (part.isWordLike) words += 1;
+      return words;
+    }
+  }
+  return (trimmed.match(/\S+/g) || []).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+}
 
 function cleanChapterEl(id) {
   const el = document.querySelector(`.chapter[data-id="${id}"] .chapter-body`);
@@ -236,10 +516,13 @@ function showFirstRun() {
     const capRow = $('#fr-dropcaps');
     capRow.innerHTML = '';
     const caps = { literary: t('Literary'), fantasy: t('Fantasy'), scifi: t('Sci-Fi') };
+    // an A of the alphabet the sample is written in, so each button shows
+    // the drop cap the writer will get (Cyrillic letters come from other faces)
+    const capA = /\p{Script=Cyrillic}/u.test($('#fr-sample-text').textContent) ? 'А' : 'A';
     for (const key of Object.keys(caps)) {
       const b = document.createElement('button');
       b.className = 'fr-font' + (picked.dropcap === key ? ' sel' : '');
-      b.innerHTML = `<span class="fr-cap" style="font-family:${DROPCAP_FONTS[key].replace(/"/g, '&quot;')}">A</span>${caps[key]}`;
+      b.innerHTML = `<span class="fr-cap" style="font-family:${DROPCAP_FONTS[key].replace(/"/g, '&quot;')}">${capA}</span>${caps[key]}`;
       b.onmouseenter = () => { document.documentElement.style.setProperty('--dropcap-font', DROPCAP_FONTS[key]); };
       b.onmouseleave = preview;
       b.onclick = () => {
@@ -258,7 +541,7 @@ function showFirstRun() {
     // the shelf was drawn (and the author record seeded as Anonymous) before
     // the name was typed — carry the name across
     currentAuthor().name = library.authorName || (library.penNames || [])[0] || t('Anonymous');
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     applyFonts();
     fr.hidden = true;
     renderShelves();
@@ -285,6 +568,25 @@ function shelvesFor(authorId) {
 
 function displayAuthor() {
   return currentAuthor().name || t('Anonymous');
+}
+
+// Redrawing the shelves used to read every book.json again — eighty files
+// through the bridge on Pocket, for a shelf rename. The shelves now keep
+// what they last read; any write to a book, and every look at the disk
+// (refreshFromDisk), forgets it.
+const bookMetaCache = new Map();
+async function shelfMeta(bookId) {
+  if (bookMetaCache.has(bookId)) return bookMetaCache.get(bookId);
+  const meta = await window.neo.readBookMeta(bookId);
+  if (meta) bookMetaCache.set(bookId, meta);
+  return meta;
+}
+// Saves a book's meta and drops the cached copy. This used to be done by
+// replacing window.neo.writeBookMeta, but on desktop that object is
+// read-only, so the assignment threw and app.js stopped loading.
+function writeBookMeta(bookId, meta) {
+  bookMetaCache.delete(bookId);
+  return window.neo.writeBookMeta(bookId, meta);
 }
 
 async function renderShelves() {
@@ -336,7 +638,7 @@ async function renderShelves() {
       if (!moving) return;
       library.shelves = library.shelves.filter((s) => s.id !== shelfId);
       library.shelves.splice(index, 0, moving);
-      await window.neo.writeLibrary(library);
+      await writeLibrary(library);
       // move the shelf on screen rather than redrawing everything
       const secs = [...wrap.querySelectorAll('.shelf')];
       const movingSec = secs.find((el) => el.dataset.shelfId === shelfId);
@@ -350,6 +652,8 @@ async function renderShelves() {
     const sec = document.createElement('section');
     sec.className = 'shelf';
     sec.dataset.shelfId = shelf.id;
+    if (isBound(shelf)) sec.classList.add('bound');
+    if (shelf.id === justBoundId) { sec.classList.add('just-bound'); justBoundId = null; }
 
     const grip = document.createElement('span');
     grip.className = 'shelf-grip';
@@ -369,22 +673,48 @@ async function renderShelves() {
 
     const label = document.createElement('span');
     label.className = 'shelf-label';
-    label.contentEditable = 'true';
+    // on a touch screen the name turns editable only when tapped, so a long
+    // press (the menu) never wakes the keyboard or selects the text
+    label.contentEditable = NO_HOVER ? 'false' : 'true';
     label.spellcheck = false;
     label.textContent = shelf.name;
     label.title = t('Click to rename · right-click to export or delete');
+    if (NO_HOVER) {
+      label.addEventListener('click', () => {
+        if (label.isContentEditable) return;
+        label.contentEditable = 'true';
+        label.focus();
+        const r = document.createRange();
+        r.selectNodeContents(label);
+        r.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+      });
+    }
     label.addEventListener('blur', async () => {
+      const before = shelf.name;
       shelf.name = label.textContent.trim() || shelf.name;
       label.textContent = shelf.name;
-      await window.neo.writeLibrary(library);
+      if (NO_HOVER) label.contentEditable = 'false';
+      await writeLibrary(library);
+      // a bound shelf's name is its book's title: the cover follows it
+      if (isBound(shelf) && shelf.name !== before) { await syncCoverTitle(shelf); renderShelves(); }
     });
     label.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); label.blur(); }
     });
-    // right-click a shelf label: publish it as one book, or delete it
+    // right-click a shelf label: bind it into one book, publish it as an
+    // anthology, or delete it (a bound shelf has a menu of its own)
     label.addEventListener('contextmenu', async (e) => {
       e.preventDefault();
-      const choice = await optionModal(t('Shelf “{name}”', { name: shelf.name }), null, [
+      if (isBound(shelf)) { await boundShelfMenu(shelf); return; }
+      const choice = await optionModal(escHtml(t('Shelf “{name}”', { name: shelf.name })), null, [
+        {
+          label: t('Bind into one book'),
+          desc: t('Its titles become one book, with a cover, front and back pages, and one table of contents.'),
+          value: 'bind'
+        },
         {
           label: t('Export shelf as anthology…'),
           desc: shelf.bookIds.length
@@ -394,7 +724,9 @@ async function renderShelves() {
         },
         { label: t('Delete shelf'), desc: t('Books move to another shelf. Nothing is deleted from disk.'), danger: true, value: 'del' }
       ]);
-      if (choice === 'anthology') {
+      if (choice === 'bind') {
+        await bindShelf(shelf);
+      } else if (choice === 'anthology') {
         await exportShelfAnthology(shelf);
       } else if (choice === 'del') {
         const mine = shelvesFor(currentAuthor().id);
@@ -404,10 +736,11 @@ async function renderShelves() {
         }
         const other = mine.find((s) => s.id !== shelf.id);
         for (const id of shelf.bookIds) {
-          if (!other.bookIds.includes(id)) other.bookIds.push(id);
+          if (isPageMeta(await shelfMeta(id))) continue; // a bound book's pages stay in the library folder
+          if (!other.bookIds.includes(id)) await placeTitle(other, id);
         }
         library.shelves = library.shelves.filter((s) => s.id !== shelf.id);
-        await window.neo.writeLibrary(library);
+        await writeLibrary(library);
         renderShelves();
       }
     });
@@ -474,9 +807,16 @@ async function renderShelves() {
         }
       }
       if (ind) ind.remove();
+      const fromShelf = shelfOf(bookId);
+      if (isBound(shelf)) {
+        if (isPageMeta(await shelfMeta(bookId))) return; // a page keeps its place
+        const { start, end } = await bodyRange(shelf, bookId);
+        index = Math.min(Math.max(index, start), end);
+      }
       for (const s of library.shelves) s.bookIds = s.bookIds.filter((b) => b !== bookId);
       shelf.bookIds.splice(index, 0, bookId);
-      await window.neo.writeLibrary(library);
+      await writeLibrary(library);
+      if (isBound(shelf) || isBound(fromShelf)) { renderShelves(); return; }
       // slide the tile into place; the shelf itself is not redrawn
       const tile = document.querySelector(`.book[data-book-id="${bookId}"]`);
       if (tile) {
@@ -486,26 +826,669 @@ async function renderShelves() {
       } else renderShelves();
     });
 
-    for (const bookId of shelf.bookIds) {
-      const meta = await window.neo.readBookMeta(bookId);
-      if (!meta) continue;
-      row.appendChild(bookTile(meta));
-    }
-
     // the blank page — click to begin
     const blank = document.createElement('div');
     blank.className = 'new-book';
     blank.textContent = '+';
     blank.title = t('Start a new book');
     blank.onclick = () => createBookOnShelf(shelf);
-    row.appendChild(blank);
+    pressable(blank, t('Start a new book'));
+
+    if (isBound(shelf)) {
+      await renderBoundRow(shelf, row, blank);
+      // the tiles of a shelf just bound settle in one after another
+      if (sec.classList.contains('just-bound')) [...row.children].forEach((el, i) => el.style.setProperty('--i', i));
+    } else {
+      for (const bookId of shelf.bookIds) {
+        const meta = await shelfMeta(bookId);
+        if (!meta || isPageMeta(meta)) continue;
+        row.appendChild(bookTile(meta));
+      }
+      row.appendChild(blank);
+    }
 
     sec.appendChild(label);
+    if (isBound(shelf)) {
+      const mark = document.createElement('span');
+      mark.className = 'shelf-bound-mark';
+      mark.textContent = t('one book');
+      sec.appendChild(mark);
+    }
     sec.appendChild(row);
     built.appendChild(sec);
   }
   wrap.replaceChildren(built);
   view.scrollTop = keepScroll;
+  fitBoundShelves();
+}
+
+// A bound shelf, measured once it's on screen: the thread under it runs as
+// far as its books do, and a page's name too long for its spine (some
+// languages have long ones) is set smaller until it fits
+function fitBoundShelves() {
+  for (const row of document.querySelectorAll('.shelf.bound .shelf-books')) {
+    const last = row.lastElementChild;
+    const box = row.getBoundingClientRect();
+    if (!last || !box.width) continue;
+    const zoom = box.width / row.offsetWidth; // the Interface Size zoom
+    row.style.setProperty('--stitch', Math.ceil((last.getBoundingClientRect().right - box.left) / zoom) + 'px');
+    for (const l of row.querySelectorAll('.pt-label')) {
+      l.style.fontSize = '';
+      l.style.letterSpacing = '';
+      const room = l.clientHeight;
+      const need = l.scrollHeight;
+      if (!room || need <= room + 1) continue;
+      const cs = getComputedStyle(l);
+      const k = room / need;
+      l.style.fontSize = Math.max(6.5, parseFloat(cs.fontSize) * k).toFixed(2) + 'px';
+      l.style.letterSpacing = ((parseFloat(cs.letterSpacing) || 0) * k).toFixed(2) + 'px';
+    }
+  }
+}
+window.addEventListener('resize', () => {
+  clearTimeout(fitBoundShelves.t);
+  fitBoundShelves.t = setTimeout(fitBoundShelves, 120);
+});
+
+/* ================================================================== */
+/*  BOUND SHELVES — a shelf that is one book                           */
+/*  Right-click a shelf's name → Bind into one book. Its titles stay   */
+/*  ordinary books to write in. A cover and the pages a published book */
+/*  carries (copyright, dedication, epigraph, parts, acknowledgments,  */
+/*  about the author) join them as small books of their own: plain     */
+/*  folders like every other, so backups, sync and Pocket carry them.  */
+/*  Hovering a bound shelf shows each missing page, faint, in its      */
+/*  place; a click adds it and opens it as the page it will print as.  */
+/*  Unbinding tucks the pages away (shelf.binding.parked) until the    */
+/*  next binding. Nothing is ever deleted by binding or unbinding.     */
+/* ================================================================== */
+
+const PAGE_FRONT = ['copyright', 'dedication', 'epigraph'];
+const PAGE_BACK = ['acknowledgments', 'about'];
+// A book's own prologue and epilogue, when it has them: story, written in
+// the editor like any title, standing before the first part and after the
+// last. (A single book's first or last chapter can take the role too.)
+const PAGE_WRITTEN = ['prologue', 'epilogue'];
+// the order each end of a bound shelf keeps
+const PAGE_LEAD = ['cover', ...PAGE_FRONT, 'prologue'];
+const PAGE_TAIL = ['epilogue', ...PAGE_BACK];
+const PAGE_KINDS = [...PAGE_LEAD, 'part', ...PAGE_TAIL];
+const isPageMeta = (m) => !!(m && PAGE_KINDS.includes(m.kind));
+const isBound = (shelf) => !!(shelf && shelf.binding && shelf.binding.bound);
+const shelfOf = (bookId) => library.shelves.find((s) => s.bookIds.includes(bookId));
+
+function pageKindName(kind) {
+  return {
+    cover: t('Cover'),
+    copyright: t('Copyright'),
+    dedication: t('Dedication'),
+    epigraph: t('Epigraph'),
+    prologue: t('Prologue'),
+    part: t('Part'),
+    epilogue: t('Epilogue'),
+    acknowledgments: t('Acknowledgments'),
+    about: t('About the Author')
+  }[kind] || kind;
+}
+
+// Part I, Part II …: roman numerals read the same in every language
+function roman(n) {
+  const r = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+  let out = '';
+  for (const [v, s] of r) while (n >= v) { out += s; n -= v; }
+  return out;
+}
+const partLabel = (n) => t('Part {n}', { n: roman(n) });
+
+// the name a bound book goes out under: the pen name that owns the shelf
+function shelfAuthorName(shelf) {
+  const all = library.authors || [];
+  const a = all.find((x) => x.id === shelf.authorId) || all[0];
+  return (a && a.name) || t('Anonymous');
+}
+
+// a new page starts with what every such page says, where that's knowable
+const PAGE_STARTERS = {
+  copyright: (shelf) =>
+    `<p>${escHtml(t('Copyright © {year} {name}', { year: String(new Date().getFullYear()), name: shelfAuthorName(shelf) }))}</p>` +
+    `<p>${escHtml(t('All rights reserved.'))}</p>`
+};
+
+async function createPageBook(shelf, kind) {
+  const written = PAGE_WRITTEN.includes(kind);
+  // a prologue opens in the editor as "Prologue", under the book's name
+  const title = kind === 'cover' || written ? (written ? pageKindName(kind) : shelf.name) : pageKindName(kind) + ' — ' + shelf.name;
+  const meta = await window.neo.createBook({ author: shelfAuthorName(shelf), title });
+  meta.title = title;
+  meta.kind = kind;
+  meta.shelfId = shelf.id; // which bound book it belongs to, for anyone reading the folder
+  if (written) {
+    meta.subtitle = shelf.name;
+    meta.tabNames = {
+      notes: (library.tabDefaults && library.tabDefaults.notes) || 'Notes',
+      outline: (library.tabDefaults && library.tabDefaults.outline) || 'Outline'
+    };
+  }
+  if (kind === 'cover') {
+    meta.coverSeed = 'bound:' + shelf.id;
+    meta.chapterOrder = [];
+  } else {
+    const chId = 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    await window.neo.writeChapter(meta.id, chId, PAGE_STARTERS[kind] ? PAGE_STARTERS[kind](shelf) : '<p><br></p>');
+    meta.chapterOrder = [chId];
+  }
+  await writeBookMeta(meta.id, meta);
+  return meta;
+}
+
+// Where titles may sit on a bound shelf: after the cover and front pages,
+// before the back pages (indexes into bookIds, without skipId)
+async function bodyRange(shelf, skipId) {
+  const ids = shelf.bookIds.filter((b) => b !== skipId);
+  const kinds = [];
+  for (const id of ids) {
+    const m = await shelfMeta(id);
+    kinds.push((m && m.kind) || '');
+  }
+  let start = 0;
+  while (start < ids.length && PAGE_LEAD.includes(kinds[start])) start++;
+  let end = ids.length;
+  while (end > start && PAGE_TAIL.includes(kinds[end - 1])) end--;
+  return { start, end };
+}
+
+// Put a title on a shelf: last in line (or first), which on a bound shelf
+// means the end (or start) of its body, never after the back pages
+async function placeTitle(shelf, bookId, atStart) {
+  shelf.bookIds = shelf.bookIds.filter((b) => b !== bookId);
+  if (!isBound(shelf)) {
+    if (atStart) shelf.bookIds.unshift(bookId); else shelf.bookIds.push(bookId);
+    return;
+  }
+  const { start, end } = await bodyRange(shelf);
+  shelf.bookIds.splice(atStart ? start : end, 0, bookId);
+}
+
+let justBoundId = null; // the shelf whose binding the next drawing shows
+async function bindShelf(shelf) {
+  shelf.binding = Object.assign({ numbering: 'through', parked: [] }, shelf.binding || {}, { bound: true });
+  restoreParked(shelf);
+  let cover = null;
+  for (const id of shelf.bookIds) {
+    const m = await shelfMeta(id);
+    if (m && m.kind === 'cover') { cover = m; break; }
+  }
+  if (!cover) {
+    cover = await createPageBook(shelf, 'cover');
+    shelf.bookIds.unshift(cover.id);
+  } else if (cover.title !== shelf.name) {
+    cover.title = shelf.name;
+    await writeBookMeta(cover.id, cover);
+  }
+  await writeLibrary(library);
+  justBoundId = shelf.id;
+  await renderShelves();
+  toast(t('“{name}” is bound into one book', { name: shelf.name }));
+}
+
+// the pages come back where they were: the cover and front pages lead, a
+// part page returns before the title it opened, the back pages close
+function restoreParked(shelf) {
+  const parked = (shelf.binding && shelf.binding.parked) || [];
+  if (!parked.length) return;
+  const front = parked.filter((p) => PAGE_LEAD.includes(p.kind))
+    .sort((a, b) => PAGE_LEAD.indexOf(a.kind) - PAGE_LEAD.indexOf(b.kind));
+  const back = parked.filter((p) => PAGE_TAIL.includes(p.kind))
+    .sort((a, b) => PAGE_TAIL.indexOf(a.kind) - PAGE_TAIL.indexOf(b.kind));
+  const body = shelf.bookIds.filter((id) => !parked.some((p) => p.id === id));
+  for (const p of parked.filter((x) => x.kind === 'part')) {
+    const at = p.before ? body.indexOf(p.before) : -1;
+    if (at >= 0) body.splice(at, 0, p.id); else body.push(p.id);
+  }
+  shelf.bookIds = [...front.map((p) => p.id), ...body, ...back.map((p) => p.id)];
+  shelf.binding.parked = [];
+}
+
+async function unbindShelf(shelf) {
+  const ids = [...shelf.bookIds];
+  const metas = [];
+  for (const id of ids) metas.push(await shelfMeta(id));
+  const parked = [];
+  const titles = [];
+  ids.forEach((id, i) => {
+    const m = metas[i];
+    if (!isPageMeta(m)) { titles.push(id); return; }
+    // a part page remembers the title it opens
+    let before = null;
+    if (m.kind === 'part') {
+      for (let j = i + 1; j < ids.length; j++) {
+        if (metas[j] && !isPageMeta(metas[j])) { before = ids[j]; break; }
+      }
+    }
+    parked.push({ id, kind: m.kind, before });
+  });
+  shelf.bookIds = titles;
+  shelf.binding = Object.assign({}, shelf.binding, { bound: false, parked });
+  await writeLibrary(library);
+  await renderShelves();
+  toast(t('Unbound. Its pages wait for the next binding.'));
+}
+
+// the shelf's name is the book's title, so a rename reaches the cover too
+async function syncCoverTitle(shelf) {
+  for (const id of shelf.bookIds) {
+    const m = await shelfMeta(id);
+    if (m && m.kind === 'cover') {
+      if (m.title !== shelf.name) { m.title = shelf.name; await writeBookMeta(m.id, m); }
+      return;
+    }
+  }
+}
+
+/* ---------- a bound shelf, drawn ---------- */
+
+async function renderBoundRow(shelf, row, blank) {
+  const items = [];
+  for (const id of shelf.bookIds) {
+    const m = await shelfMeta(id);
+    if (m) items.push(m);
+  }
+  let f = 0;
+  while (f < items.length && PAGE_LEAD.includes(items[f].kind)) f++;
+  let b = items.length;
+  while (b > f && PAGE_TAIL.includes(items[b - 1].kind)) b--;
+  const front = items.slice(0, f);
+  const body = items.slice(f, b);
+  const back = items.slice(b);
+  const cover = front.find((m) => m.kind === 'cover');
+  if (cover) row.appendChild(boundCoverTile(shelf, cover));
+  const offer = missingPages(body);
+  appendPageZone(row, shelf, front.filter((m) => m.kind !== 'cover'), [...PAGE_FRONT, 'prologue'], offer);
+  let parts = 0;
+  body.forEach((m, i) => {
+    if (m.kind === 'part') {
+      parts += 1;
+      row.appendChild(pageTile(shelf, m, partLabel(parts)));
+      return;
+    }
+    if (isPageMeta(m)) { row.appendChild(pageTile(shelf, m, pageKindName(m.kind))); return; }
+    const prev = body[i - 1];
+    if (!NO_HOVER && !(prev && prev.kind === 'part')) row.appendChild(partSeam(shelf, m.id));
+    row.appendChild(bookTile(m));
+  });
+  row.appendChild(blank);
+  appendPageZone(row, shelf, back, PAGE_TAIL, offer);
+}
+
+// Which pages a bound book could still take. A book of one title whose
+// first chapter is already its prologue isn't offered another (nor one
+// whose last chapter is its epilogue).
+function missingPages(body) {
+  const titles = body.filter((m) => !isPageMeta(m));
+  const lone = titles.length === 1 ? titles[0] : null;
+  const own = (role) => !!lone && (lone.chapterOrder || []).some((c) => chapterRole(c, lone) === role);
+  return (kind) => !(PAGE_WRITTEN.includes(kind) && own(kind));
+}
+
+// the pages of one end of the book, each in its place, with a faint
+// stand-in (shown on hover) wherever one could be added
+function appendPageZone(row, shelf, have, kinds, offer) {
+  const left = [...have];
+  for (const k of kinds) {
+    const i = left.findIndex((m) => m.kind === k);
+    if (i >= 0) row.appendChild(pageTile(shelf, left.splice(i, 1)[0], pageKindName(k)));
+    else if (!NO_HOVER && offer(k)) row.appendChild(ghostPage(shelf, k));
+  }
+  for (const m of left) row.appendChild(pageTile(shelf, m, pageKindName(m.kind)));
+}
+
+function boundCoverTile(shelf, meta) {
+  // the cover wears the shelf's name, whatever its folder was first called
+  const shown = Object.assign({}, meta, { title: shelf.name, author: meta.author || shelfAuthorName(shelf) });
+  const el = bookTile(shown, { cover: shelf });
+  el.classList.add('bound-cover');
+  el.draggable = false;
+  return el;
+}
+
+// a page's name runs up its spine; a long one is set smaller to fit
+const spineFit = (label) => (label.length > 17 ? ' longer' : label.length > 12 ? ' long' : '');
+
+function pageTile(shelf, meta, label) {
+  const el = document.createElement('div');
+  el.className = 'book page-tile kind-' + meta.kind + spineFit(label);
+  el.dataset.bookId = meta.id;
+  el.draggable = false;
+  const span = document.createElement('span');
+  span.className = 'pt-label';
+  span.textContent = label;
+  el.appendChild(span);
+  el.title = label;
+  el.onclick = () => openPage(shelf, meta, label);
+  pressable(el, label);
+  el.addEventListener('contextmenu', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const choice = await optionModal(escHtml(label), null, [
+      { label: t('Open'), value: 'open' },
+      {
+        label: t('Remove page'),
+        desc: window.Capacitor
+          ? t('Removes the book folder. The Files app keeps it in Recently Deleted for 30 days.')
+          : t('Sends the page to your system trash, where you can recover it.'),
+        danger: true, value: 'remove'
+      }
+    ]);
+    if (choice === 'open') openPage(shelf, meta, label);
+    else if (choice === 'remove' && await window.neo.deleteBook(meta.id, label)) {
+      shelf.bookIds = shelf.bookIds.filter((b) => b !== meta.id);
+      await writeLibrary(library);
+      renderShelves();
+    }
+  });
+  return el;
+}
+
+function ghostPage(shelf, kind) {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'ghost-page' + spineFit(pageKindName(kind));
+  el.innerHTML = '<span class="gp-plus" aria-hidden="true">+</span><span class="pt-label"></span>';
+  el.querySelector('.pt-label').textContent = pageKindName(kind);
+  el.title = pageKindName(kind);
+  el.setAttribute('aria-label', pageKindName(kind));
+  el.onclick = () => addPage(shelf, kind);
+  return el;
+}
+
+function partSeam(shelf, beforeId) {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'part-seam';
+  el.title = t('Start a part here');
+  el.setAttribute('aria-label', t('Start a part here'));
+  el.innerHTML = '<span class="ps-line"></span><span class="ps-plus">+</span>';
+  el.onclick = () => addPage(shelf, 'part', beforeId);
+  return el;
+}
+
+// A new page goes where books put it: front pages after the cover in their
+// usual order, back pages at the end in theirs, a part before its title
+async function addPage(shelf, kind, beforeId) {
+  const meta = await createPageBook(shelf, kind);
+  const ids = shelf.bookIds;
+  let at = ids.length;
+  if (kind === 'part') {
+    at = beforeId ? ids.indexOf(beforeId) : -1;
+    if (at < 0) at = (await bodyRange(shelf)).end;
+  } else if (PAGE_LEAD.includes(kind)) {
+    at = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const m = await shelfMeta(ids[i]);
+      const k = m && m.kind;
+      if (PAGE_LEAD.includes(k) && PAGE_LEAD.indexOf(k) < PAGE_LEAD.indexOf(kind)) at = i + 1;
+      else break;
+    }
+  } else {
+    for (let i = ids.length - 1; i >= 0; i--) {
+      const m = await shelfMeta(ids[i]);
+      const k = m && m.kind;
+      if (PAGE_TAIL.includes(k) && PAGE_TAIL.indexOf(k) > PAGE_TAIL.indexOf(kind)) at = i;
+      else break;
+    }
+  }
+  ids.splice(at, 0, meta.id);
+  await writeLibrary(library);
+  await renderShelves();
+  let label = pageKindName(kind);
+  if (kind === 'part') {
+    let n = 0;
+    for (const id of shelf.bookIds) {
+      const m = await shelfMeta(id);
+      if (m && m.kind === 'part') n += 1;
+      if (id === meta.id) break;
+    }
+    label = partLabel(n);
+  }
+  openPage(shelf, meta, label);
+}
+
+// A prologue or an epilogue is story: it opens in the editor, ready to
+// write in. Every other page opens as the sheet it will print on.
+async function openPage(shelf, meta, label) {
+  if (!PAGE_WRITTEN.includes(meta.kind)) { openPageSheet(shelf, meta, label); return; }
+  await openBook(meta.id);
+  // a first visit starts at the top of the page, under its title
+  if (book && book.id === meta.id && !book.lastPosition && book.chapterOrder[0]) focusChapterStart(book.chapterOrder[0]);
+}
+
+/* ---------- a page, open as it will print ---------- */
+
+const PAGE_PLACEHOLDERS = {
+  dedication: () => t('For…'),
+  epigraph: () => '…',
+  part: () => t('Title')
+};
+
+// Whatever the editing engine left, a page is stored as NEO's plain
+// paragraphs: loose text and <div>s become <p>s, stray <br>s go
+function normalizePageBody(body) {
+  let cur = null;
+  for (const node of [...body.childNodes]) {
+    if (node.nodeType === 1 && /^(P|DIV|H[1-6]|BLOCKQUOTE|LI|UL|OL)$/.test(node.tagName)) {
+      cur = null;
+      if (node.tagName !== 'P') {
+        const p = document.createElement('p');
+        while (node.firstChild) p.appendChild(node.firstChild);
+        node.replaceWith(p);
+      }
+      continue;
+    }
+    const blank = (node.nodeType === 3 && !node.textContent.trim()) || (node.nodeType === 1 && node.tagName === 'BR');
+    if (!cur && blank) { node.remove(); continue; }
+    if (!cur) {
+      cur = document.createElement('p');
+      body.insertBefore(cur, node);
+    }
+    cur.appendChild(node);
+  }
+  if (!body.querySelector('p')) body.innerHTML = '<p><br></p>';
+}
+
+function sheetBackdrop(kind, label, inner) {
+  const bd = document.createElement('div');
+  bd.className = 'modal-backdrop page-sheet-backdrop';
+  bd.innerHTML = `
+    <div class="page-sheet" role="dialog" aria-modal="true">
+      <div class="ps-bar"><span class="ps-name"></span><button class="m-ok ps-done">${t('Done')}</button></div>
+      <div class="ps-paper kind-${kind}">${inner}</div>
+    </div>`;
+  bd.querySelector('.ps-name').textContent = label;
+  bd.querySelector('.page-sheet').setAttribute('aria-label', label);
+  return bd;
+}
+
+// the lines of a page that say who said the lines above them (a dash first)
+const ATTRIBUTED_PAGES = ['dedication', 'epigraph', 'part'];
+
+async function openPageSheet(shelf, meta, label) {
+  const live = (await window.neo.readBookMeta(meta.id)) || meta;
+  let chId = (live.chapterOrder || [])[0];
+  if (!chId) {
+    chId = 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    live.chapterOrder = [chId];
+    await writeBookMeta(live.id, live);
+  }
+  const html = await window.neo.readChapter(live.id, chId);
+  const bd = sheetBackdrop(live.kind, label, '<div class="ps-label" hidden></div><div class="ps-body" contenteditable="true" role="textbox" aria-multiline="true"></div>');
+  const lab = bd.querySelector('.ps-label');
+  if (live.kind === 'part') { lab.hidden = false; lab.textContent = label; }
+  if (PAGE_BACK.includes(live.kind)) { lab.hidden = false; lab.textContent = pageKindName(live.kind); }
+  const body = bd.querySelector('.ps-body');
+  body.setAttribute('aria-label', label);
+  body.innerHTML = html && html.trim() ? html : '<p><br></p>';
+  if (PAGE_PLACEHOLDERS[live.kind]) body.dataset.ph = PAGE_PLACEHOLDERS[live.kind]();
+  // the page shows what it will print: a line that opens with a dash is set
+  // as the name of whoever said the lines above it
+  const settle = () => {
+    body.classList.toggle('empty', !body.textContent.trim());
+    if (!ATTRIBUTED_PAGES.includes(live.kind)) return;
+    for (const p of body.querySelectorAll('p')) p.toggleAttribute('data-attr', isAttribution({ text: p.textContent.trim() }));
+  };
+  settle();
+  let timer = null;
+  let saved = body.innerHTML;
+  const save = async () => {
+    clearTimeout(timer);
+    timer = null;
+    normalizePageBody(body);
+    const out = body.cloneNode(true);
+    out.querySelectorAll('[data-attr]').forEach((p) => p.removeAttribute('data-attr'));
+    if (out.innerHTML === saved) return;
+    saved = out.innerHTML;
+    await window.neo.writeChapter(live.id, chId, saved);
+  };
+  body.addEventListener('input', () => {
+    settle();
+    clearTimeout(timer);
+    timer = setTimeout(save, 600);
+  });
+  body.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const pasted = e.clipboardData.getData('text/html');
+    const text = e.clipboardData.getData('text/plain');
+    if (pasted) document.execCommand('insertHTML', false, cleanPasteHtml(pasted));
+    else if (text) {
+      text.replace(/\r/g, '').split(/\n+/).filter((p) => p.trim()).forEach((p, i) => {
+        if (i > 0) document.execCommand('insertParagraph');
+        document.execCommand('insertText', false, p.trim());
+      });
+    }
+  });
+  document.body.appendChild(bd);
+  document.execCommand('defaultParagraphSeparator', false, 'p');
+  const close = async () => {
+    if (!bd.isConnected) return;
+    await save();
+    bd.remove();
+  };
+  bd.querySelector('.ps-done').onclick = close;
+  bd.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  // the caret waits at the end of whatever the page already says
+  body.focus();
+  caretToEnd(body.lastElementChild || body);
+}
+
+function caretToEnd(el) {
+  const r = document.createRange();
+  r.selectNodeContents(el);
+  r.collapse(false);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
+// The cover opens to the title page: the book's title (the shelf's name),
+// a subtitle, and the name it goes out under. One line each; Enter moves on.
+async function openTitlePage(shelf, coverMeta) {
+  const live = (await window.neo.readBookMeta(coverMeta.id)) || coverMeta;
+  const bd = sheetBackdrop('title', t('Title Page'), `
+    <div class="tp-field tp-t" contenteditable="true" role="textbox" spellcheck="false"></div>
+    <div class="tp-field tp-s" contenteditable="true" role="textbox" spellcheck="false"></div>
+    <div class="tp-field tp-a" contenteditable="true" role="textbox" spellcheck="false"></div>`);
+  const fields = ['.tp-t', '.tp-s', '.tp-a'].map((s) => bd.querySelector(s));
+  const [ti, su, au] = fields;
+  const text = (el) => el.textContent.replace(/\s+/g, ' ').trim();
+  [[ti, shelf.name, t('Title')], [su, live.subtitle || '', t('Subtitle')], [au, live.author || shelfAuthorName(shelf), t('Author')]]
+    .forEach(([el, value, name]) => {
+      el.textContent = value;
+      el.dataset.ph = name;
+      el.setAttribute('aria-label', name);
+    });
+  const close = async () => {
+    if (!bd.isConnected) return;
+    bd.remove();
+    const title = text(ti) || shelf.name;
+    const subtitle = text(su);
+    const author = text(au) || shelfAuthorName(shelf);
+    if (title === shelf.name && subtitle === (live.subtitle || '') && author === (live.author || '')) return;
+    shelf.name = title;
+    live.title = title;
+    live.subtitle = subtitle;
+    live.author = author;
+    await writeBookMeta(live.id, live);
+    await writeLibrary(library);
+    renderShelves();
+  };
+  for (const f of fields) {
+    // an emptied line shows its name again
+    f.addEventListener('input', () => { if (!f.textContent) f.innerHTML = ''; });
+    f.addEventListener('paste', (e) => {
+      e.preventDefault();
+      document.execCommand('insertText', false, e.clipboardData.getData('text/plain').replace(/\s+/g, ' '));
+    });
+    f.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const next = fields[fields.indexOf(f) + 1];
+      if (next) { next.focus(); caretToEnd(next); } else close();
+    });
+  }
+  document.body.appendChild(bd);
+  bd.querySelector('.ps-done').onclick = close;
+  bd.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  ti.focus();
+  const r = document.createRange();
+  r.selectNodeContents(ti);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
+/* ---------- the bound shelf's own menu (right-click its name) ---------- */
+
+async function boundShelfMenu(shelf) {
+  const through = (shelf.binding.numbering || 'through') !== 'restart';
+  const options = [
+    { label: t('Export the book…'), desc: t('EPUB, Word or PDF, with its cover, its pages and one table of contents.'), value: 'export' },
+    {
+      label: (through ? '✓ ' : '') + t('Number chapters straight through'),
+      desc: through ? t('Each title picks up where the one before it left off.') : t('Each title starts again at Chapter 1.'),
+      value: 'numbering'
+    },
+    { label: t('Unbind'), desc: t('A shelf of separate titles again. Its pages wait for the next binding.'), value: 'unbind' }
+  ];
+  // a touch screen has no hover to show the pages it could still have
+  const missing = [];
+  if (NO_HOVER) {
+    const have = new Set();
+    const body = [];
+    for (const id of shelf.bookIds) {
+      const m = await shelfMeta(id);
+      if (isPageMeta(m)) have.add(m.kind);
+      else if (m) body.push(m);
+    }
+    const offer = missingPages(body);
+    missing.push(...[...PAGE_FRONT, 'prologue', 'epilogue', ...PAGE_BACK].filter((k) => !have.has(k) && offer(k)));
+    if (missing.length) options.splice(1, 0, { label: t('Add a page…'), value: 'page' });
+  }
+  const choice = await optionModal(escHtml(t('“{name}” · one book', { name: shelf.name })), null, options);
+  if (choice === 'export') {
+    await exportBoundBook(shelf);
+  } else if (choice === 'page') {
+    const kind = await optionModal(t('Add a page…'), null, missing.map((k) => ({ label: pageKindName(k), value: k })));
+    if (kind) await addPage(shelf, kind);
+  } else if (choice === 'numbering') {
+    shelf.binding.numbering = through ? 'restart' : 'through';
+    await writeLibrary(library);
+    toast(through ? t('Each title starts again at Chapter 1') : t('Chapters are numbered straight through'));
+  } else if (choice === 'unbind') {
+    await unbindShelf(shelf);
+  }
 }
 
 // single shared drop-position indicator for shelf drags
@@ -576,7 +1559,7 @@ function dressTile(el, meta) {
   });
 }
 
-function bookTile(meta) {
+function bookTile(meta, opts = {}) {
   const el = document.createElement('div');
   el.className = 'book';
   el.dataset.bookId = meta.id;
@@ -602,7 +1585,9 @@ function bookTile(meta) {
   el.title = meta.wordGoal
     ? t('{title} — {count} / {goal} words', { title: meta.title, count: meta.wordCount || 0, goal: meta.wordGoal })
     : meta.title;
-  el.onclick = () => openBook(meta.id);
+  el.onclick = () => (opts.cover ? openTitlePage(opts.cover, meta) : openBook(meta.id));
+  pressable(el, [el.title, meta.author ? t('by {author}', { author: meta.author }) : ''].filter(Boolean).join(', '));
+  el.querySelector('.b-refresh').setAttribute('aria-hidden', 'true'); // the book's right-click menu offers the same
   el.addEventListener('dragstart', (e) => {
     e.dataTransfer.setData('application/x-neo-book', meta.id);
     // the ghost that rides under the cursor is a faded, smaller cover, held
@@ -633,7 +1618,7 @@ function bookTile(meta) {
       if (fname) {
         meta.coverImage = fname;
         meta.coverMode = 'image';
-        await window.neo.writeBookMeta(meta.id, meta);
+        await writeBookMeta(meta.id, meta);
         renderShelves();
       }
     } else if (/\.(docx|txt|md)$/i.test(p)) {
@@ -645,54 +1630,86 @@ function bookTile(meta) {
 
   el.addEventListener('contextmenu', async (e) => {
     e.preventDefault();
-    const options = [
-      { label: meta.coverImage ? t('Replace cover art…') : t('Set cover art…'), desc: t('Pick an image (2:3 works best). Or just drag one from Finder onto the book.'), value: 'cover' }
-    ];
+    if (opts.cover) { await boundCoverMenu(opts.cover, meta, el); return; }
+    const options = [];
+    // on a bound shelf, a title can open a new part of the book
+    const home = shelfOf(meta.id);
+    if (isBound(home)) {
+      const at = home.bookIds.indexOf(meta.id);
+      const prev = at > 0 ? bookMetaCache.get(home.bookIds[at - 1]) : null;
+      if (!(prev && prev.kind === 'part')) {
+        options.push({ label: t('Start a part here'), desc: t('A part page goes in before “{title}”.', { title: escHtml(meta.title) }), value: 'part' });
+      }
+    }
+    // no hover on a touch screen, so the ↻ that lives under the pointer
+    // moves into the menu; picking an image file is a desktop affair
+    if (NO_HOVER) options.push({ label: t('New cover'), desc: t('Another abstract cover for this book.'), value: 'refresh' });
+    else options.push({ label: meta.coverImage ? t('Replace cover art…') : t('Set cover art…'), desc: t('Pick an image (2:3 works best). Or just drag one from Finder onto the book.'), value: 'cover' });
     if (meta.coverImage) {
       options.push({ label: t('Remove cover art'), desc: t('Deletes the image from the book folder. (To just hide it, use the ↻ on the book.)'), danger: true, value: 'uncover' });
     }
+    // Pocket has no File menu: export lives here and in the ⋯ sheet
+    if (window.Capacitor) options.push({ label: t('Export…'), desc: t('Text, Markdown, HTML, Word or EPUB, through the share sheet.'), value: 'export' });
     options.push(
+      // the ↻ on the cover, for the keyboard and screen readers
+      { label: t('New cover'), value: 'refresh' },
       { label: t('Set word goal…'), desc: t('Adds the subtle progress bar to the cover.'), value: 'goal' },
       { label: t('Remove from bookshelf'), desc: t('Takes it off your shelves. The files stay safe in your NEO Library folder on disk.'), value: 'remove' },
-      {
-        label: navigator.platform.toLowerCase().includes('win') ? t('Move to Recycle Bin') : t('Move to Trash'),
-        desc: t('Sends the book folder to your system trash, where you can recover it.'),
-        danger: true, value: 'trash'
-      }
+      window.Capacitor
+        ? { label: t('Delete book'), desc: t('Removes the book folder. The Files app keeps it in Recently Deleted for 30 days.'), danger: true, value: 'trash' }
+        : {
+          label: navigator.platform.toLowerCase().includes('win') ? t('Move to Recycle Bin') : t('Move to Trash'),
+          desc: t('Sends the book folder to your system trash, where you can recover it.'),
+          danger: true, value: 'trash'
+        }
     );
-    const choice = await optionModal(`“${meta.title}”`, null, options);
-    if (choice === 'cover') {
+    const choice = await optionModal(`“${escHtml(meta.title)}”`, null, options);
+    if (choice === 'part') {
+      await addPage(home, 'part', meta.id);
+    } else if (choice === 'refresh') {
+      await refreshCover(meta, el);
+    } else if (choice === 'export') {
+      const fmt = await optionModal(t('Export “{title}”', { title: meta.title }), null, [
+        { label: t('Text (.txt)'), value: 'txt' }, { label: t('Markdown (.md)'), value: 'md' }, { label: t('HTML (.html)'), value: 'html' },
+        { label: t('Word (.docx)'), value: 'docx' }, { label: t('EPUB (.epub)'), value: 'epub' }
+      ]);
+      if (!fmt) return;
+      await openBook(meta.id);
+      await doExport(fmt);
+    } else if (choice === 'cover') {
       const src = await window.neo.pickCover();
       if (!src) return;
       const fname = await window.neo.setCover(meta.id, src);
       if (fname) {
         meta.coverImage = fname;
         meta.coverMode = 'image';
-        await window.neo.writeBookMeta(meta.id, meta);
+        await writeBookMeta(meta.id, meta);
         renderShelves();
       }
+    } else if (choice === 'refresh') {
+      await refreshCover(meta, el);
     } else if (choice === 'uncover') {
       await window.neo.removeCover(meta.id);
       meta.coverImage = null;
-      await window.neo.writeBookMeta(meta.id, meta);
+      await writeBookMeta(meta.id, meta);
       renderShelves();
     } else if (choice === 'goal') {
       const goal = await askInput(t('Word count goal for “{title}”', { title: meta.title }), t('e.g. 80000 — blank removes the goal'),
         meta.wordGoal ? String(meta.wordGoal) : '');
       if (goal === null) return;
       meta.wordGoal = parseInt(goal, 10) || 0;
-      await window.neo.writeBookMeta(meta.id, meta);
+      await writeBookMeta(meta.id, meta);
       renderShelves();
     } else if (choice === 'remove') {
       for (const s of library.shelves) s.bookIds = s.bookIds.filter((b) => b !== meta.id);
-      await window.neo.writeLibrary(library);
+      await writeLibrary(library);
       renderShelves();
       toast(t('“{title}” removed from the shelves — its files are still in your NEO Library', { title: meta.title }));
     } else if (choice === 'trash') {
       const ok = await window.neo.deleteBook(meta.id, meta.title);
       if (ok) {
         for (const s of library.shelves) s.bookIds = s.bookIds.filter((b) => b !== meta.id);
-        await window.neo.writeLibrary(library);
+        await writeLibrary(library);
         renderShelves();
       }
     }
@@ -710,6 +1727,7 @@ const STALE_PAINT_MS = 10 * 60 * 1000; // a job that never came back
 
 function paintable(meta) {
   if (!meta || meta.coverImage) return false; // the writer's own art is never painted over
+  if (meta.kind) return false; // a bound book's pages show no cover of their own
   if ((meta.wordCount || 0) < PAINT_AT) return false;
   const art = meta.coverArt;
   if (!art) return true;
@@ -727,14 +1745,14 @@ async function requestPaint(meta, text) {
   if (!(await window.neo.hasSecret(provider))) {
     if (!library.coverArtNudged) {
       library.coverArtNudged = true;
-      await window.neo.writeLibrary(library);
+      await writeLibrary(library);
       toast(t('This story just passed {n} words — add an API key under File → Cover Art… and NEO will paint it a cover.', { n: PAINT_AT }), 8000);
     }
     return;
   }
   meta.coverArt = { status: 'pending', at: new Date().toISOString(), words: meta.wordCount || 0 };
   if (book && book.id === meta.id) scheduleMetaSave();
-  else await window.neo.writeBookMeta(meta.id, meta);
+  else await writeBookMeta(meta.id, meta);
   markPainting(meta.id, true);
   if (text == null) {
     const m = await window.neo.readBookMeta(meta.id);
@@ -767,7 +1785,7 @@ async function requestPaint(meta, text) {
     toast(t('NEO couldn’t paint that cover: {error}', { error: live.coverArt.error }), 7000);
   }
   if (live === book) scheduleMetaSave();
-  else await window.neo.writeBookMeta(meta.id, live);
+  else await writeBookMeta(meta.id, live);
   markPainting(meta.id, false);
   if (!$('#bookshelf-view').hidden) renderShelves();
 }
@@ -787,7 +1805,8 @@ function markPainting(bookId, on) {
 async function refreshCover(meta, el) {
   const mode = coverMode(meta);
   const enough = (meta.wordCount || 0) >= PAINT_AT;
-  const hasKey = await window.neo.hasSecret(coverProvider());
+  // a bound book's cover has no text of its own to paint from
+  const hasKey = meta.kind !== 'cover' && await window.neo.hasSecret(coverProvider());
   const options = [];
   if (meta.coverImage && mode !== 'image') options.push({ label: t('Show your cover art'), desc: t('The image you gave this book.'), value: 'image' });
   if (hasPainting(meta) && mode !== 'painted') options.push({ label: t('Show NEO’s painting'), desc: t('The cover painted from the text.'), value: 'painted' });
@@ -814,7 +1833,7 @@ async function refreshCover(meta, el) {
   } else {
     live.coverMode = choice;
   }
-  if (live === book) scheduleMetaSave(); else await window.neo.writeBookMeta(meta.id, live);
+  if (live === book) scheduleMetaSave(); else await writeBookMeta(meta.id, live);
   dressTile(el, live);
 }
 
@@ -824,9 +1843,9 @@ async function createBookOnShelf(shelf) {
     notes: (library.tabDefaults && library.tabDefaults.notes) || 'Notes',
     outline: (library.tabDefaults && library.tabDefaults.outline) || 'Outline'
   };
-  await window.neo.writeBookMeta(meta.id, meta);
-  shelf.bookIds.push(meta.id);
-  await window.neo.writeLibrary(library);
+  await writeBookMeta(meta.id, meta);
+  await placeTitle(shelf, meta.id);
+  await writeLibrary(library);
   openBook(meta.id);
 }
 
@@ -861,8 +1880,24 @@ $('#add-shelf-btn').onclick = async () => {
     bookIds: [],
     authorId: currentAuthor().id
   });
-  await window.neo.writeLibrary(library);
-  renderShelves();
+  await writeLibrary(library);
+  await renderShelves();
+  // the new shelf may be below the fold: bring it up, name ready to type over
+  const shelves = $$('#shelves .shelf');
+  const last = shelves[shelves.length - 1];
+  if (last) {
+    last.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
+    const label = last.querySelector('.shelf-label');
+    if (label) setTimeout(() => {
+      if (NO_HOVER) { label.click(); return; }
+      label.focus();
+      const r = document.createRange();
+      r.selectNodeContents(label); // selected: typing replaces "New Shelf"
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }, 350);
+  }
 };
 
 // Drag a book up to your name: if you write under other names too, a little
@@ -946,10 +1981,10 @@ async function moveBookToAuthor(bookId, authorId) {
     authorId: currentAuthor().id, at: Date.now()
   };
   for (const s of library.shelves) s.bookIds = s.bookIds.filter((b) => b !== bookId);
-  shelf.bookIds.unshift(bookId); // the top shelf, first in line
+  await placeTitle(shelf, bookId, true); // the top shelf, first in line
   meta.author = target.name;
-  await window.neo.writeBookMeta(bookId, meta);
-  await window.neo.writeLibrary(library);
+  await writeBookMeta(bookId, meta);
+  await writeLibrary(library);
   renderShelves();
   toast(t('“{title}” now sits on {name}’s top shelf — Esc puts it back', { title: meta.title, name: target.name }), 6000);
 }
@@ -961,8 +1996,8 @@ async function undoShelfMove() {
   for (const s of library.shelves) s.bookIds = s.bookIds.filter((b) => b !== m.bookId);
   home.bookIds.splice(Math.min(m.index, home.bookIds.length), 0, m.bookId);
   const meta = await window.neo.readBookMeta(m.bookId);
-  if (meta) { meta.author = m.author; await window.neo.writeBookMeta(m.bookId, meta); }
-  await window.neo.writeLibrary(library);
+  if (meta) { meta.author = m.author; await writeBookMeta(m.bookId, meta); }
+  await writeLibrary(library);
   renderShelves();
   toast(t('“{title}” is back where it was', { title: m.title }));
   return true;
@@ -981,15 +2016,16 @@ document.addEventListener('keydown', (e) => {
 // this puts it back, on the current name's first shelf
 async function reshelveBook() {
   const all = await window.neo.listBooks();
-  const shelved = new Set(library.shelves.flatMap((s) => s.bookIds));
-  const loose = all.filter((b) => !shelved.has(b.id)).sort((a, b) => (b.modified || '').localeCompare(a.modified || ''));
+  const shelved = new Set(library.shelves.flatMap((s) => [...s.bookIds, ...((s.binding && s.binding.parked) || []).map((p) => p.id)]));
+  // a bound book's pages aren't books to write in
+  const loose = all.filter((b) => !shelved.has(b.id) && !b.kind).sort((a, b) => (b.modified || '').localeCompare(a.modified || ''));
   if (!loose.length) { toast(t('Every book in your library is already on a shelf')); return; }
   const pick = await optionModal(t('Books in your library that aren’t on a shelf'), null,
     loose.map((b) => ({ label: b.title, desc: b.author ? t('by {author}', { author: b.author }) : '', value: b.id })));
   if (!pick) return;
   const shelf = shelvesFor(currentAuthor().id)[0] || library.shelves[0];
-  shelf.bookIds.push(pick);
-  await window.neo.writeLibrary(library);
+  await placeTitle(shelf, pick);
+  await writeLibrary(library);
   renderShelves();
   toast(t('“{title}” is back on the shelf', { title: loose.find((b) => b.id === pick).title }));
 }
@@ -1041,7 +2077,7 @@ $('#author-chip').onclick = async () => {
     library.currentAuthorId = target.id;
     library.authorName = library.authors[0].name;
   }
-  await window.neo.writeLibrary(library);
+  await writeLibrary(library);
   renderShelves();
 };
 
@@ -1057,6 +2093,7 @@ async function openBook(bookId) {
   undoStack = [];
   chapterHTML = {};
   savedHTML = {};
+  diskStamps = {};
   for (const chId of book.chapterOrder) {
     chapterHTML[chId] = await window.neo.readChapter(bookId, chId);
     savedHTML[chId] = chapterHTML[chId];
@@ -1104,66 +2141,113 @@ async function openBook(bookId) {
   // the Enter hint shows once per library, ever
   if (!library.hintShown) {
     library.hintShown = true;
-    window.neo.writeLibrary(library);
+    writeLibrary(library);
     setTimeout(() => toast(t('Enter twice = section break · three times = new chapter · {key} shows everything else', { key: KHELP }), 7000), 800);
   }
 }
+
+// the pages that show a faint word until they have their own
+const PAGE_PROMPTS = { dedication: () => t('For…'), epigraph: () => '…', part: () => t('Title') };
 
 function renderChapters() {
   const wrap = $('#chapters');
   wrap.innerHTML = '';
   wordCache = {};
   book.chapterTitles = book.chapterTitles || {};
+  settleChapterKinds();
   // a lone chapter is just "the story" — no heading until a second one exists,
   // at which point both appear, numbered in retrospect
-  const solo = book.chapterOrder.length === 1;
-  book.chapterOrder.forEach((chId, i) => {
+  const solo = soloStory();
+  book.chapterOrder.forEach((chId) => {
+    const kind = chapterKind(chId);
+    const story = STORY_KINDS.includes(kind);
     const sec = document.createElement('section');
-    sec.className = 'chapter sheet' + (solo ? ' solo' : '');
+    sec.className = `chapter sheet kind-${kind}` + (chId === solo ? ' solo' : '') + (story ? '' : ' bookpage');
     sec.dataset.id = chId;
+    const role = chapterRole(chId);
+    if (role) sec.classList.add(role);
     const head = document.createElement('div');
     head.className = 'chapter-head';
-    head.title = t('Right-click for chapter options · click after the number to add a title');
+    head.id = 'ch-head-' + chId;
     const num = document.createElement('span');
     num.className = 'ch-num';
-    num.textContent = t('Chapter {n}', { n: i + 1 });
-    const sep = document.createElement('span');
-    sep.className = 'ch-sep';
-    sep.textContent = '—';
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'ch-title';
-    titleSpan.contentEditable = 'true';
-    titleSpan.spellcheck = false;
-    titleSpan.textContent = book.chapterTitles[chId] || '';
-    if (titleSpan.textContent) head.classList.add('has-title');
-    titleSpan.addEventListener('input', () => {
-      head.classList.toggle('has-title', titleSpan.textContent.trim() !== '');
-    });
-    titleSpan.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && e.shiftKey) {
-        e.preventDefault();
-        titleSpan.blur();
-        poetryUnderHeading(sec.querySelector('.chapter-body'), chId);
-      } else if (e.key === 'Enter') { e.preventDefault(); titleSpan.blur(); }
-      e.stopPropagation();
-    });
-    titleSpan.addEventListener('blur', () => {
-      book.chapterTitles[chId] = titleSpan.textContent.trim();
-      scheduleMetaSave();
-      renderNav();
-    });
+    num.textContent = chapterName(chId);
     head.appendChild(num);
-    head.appendChild(sep);
-    head.appendChild(titleSpan);
+    if (story) {
+      head.title = t('Right-click for chapter options · click after the number to add a title');
+      const sep = document.createElement('span');
+      sep.className = 'ch-sep';
+      sep.setAttribute('aria-hidden', 'true');
+      sep.textContent = '—';
+      const titleSpan = document.createElement('span');
+      titleSpan.className = 'ch-title';
+      titleSpan.contentEditable = 'true';
+      titleSpan.spellcheck = false;
+      titleSpan.textContent = book.chapterTitles[chId] || '';
+      if (titleSpan.textContent) head.classList.add('has-title');
+      titleSpan.addEventListener('input', () => {
+        head.classList.toggle('has-title', titleSpan.textContent.trim() !== '');
+      });
+      titleSpan.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && e.shiftKey) {
+          e.preventDefault();
+          titleSpan.blur();
+          poetryUnderHeading(sec.querySelector('.chapter-body'), chId);
+        } else if (e.key === 'Enter') { e.preventDefault(); titleSpan.blur(); }
+        e.stopPropagation();
+      });
+      titleSpan.addEventListener('blur', () => {
+        book.chapterTitles[chId] = titleSpan.textContent.trim();
+        scheduleMetaSave();
+        renderNav();
+      });
+      head.appendChild(sep);
+      head.appendChild(titleSpan);
+    }
     head.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      chapterMenu(chId, i);
+      chapterMenu(chId, e.clientX, e.clientY);
     });
     const body = document.createElement('div');
     body.className = 'chapter-body';
+    sec.appendChild(head);
+    sec.appendChild(body);
+    wrap.appendChild(sec);
+    if (kind === 'contents') {
+      // the contents are the book's own shape, kept up to date: nothing to type
+      body.hidden = true;
+      const list = document.createElement('ol');
+      list.className = 'toc-list';
+      sec.appendChild(list);
+      return;
+    }
     body.contentEditable = 'true';
+    // screen readers name each chapter by its heading (a lone chapter by the book)
+    body.setAttribute('role', 'textbox');
+    body.setAttribute('aria-multiline', 'true');
+    if (chId === solo) body.setAttribute('aria-label', book.title || t('The story'));
+    else body.setAttribute('aria-labelledby', head.id);
     body.spellcheck = false; // NEO runs its own spellcheck pass
+    if (!story) body.classList.add('no-cap');
     body.innerHTML = chapterHTML[chId] || '<p><br></p>';
+    if (PAGE_PROMPTS[kind]) {
+      body.dataset.ph = PAGE_PROMPTS[kind]();
+      const blank = () => body.classList.toggle('blank', !body.textContent.trim());
+      blank();
+      body.addEventListener('input', blank);
+    }
+    // a line that opens with a dash is set as the name of whoever said the
+    // lines above it, as it will print
+    if (ATTRIBUTED_PAGES.includes(kind)) {
+      const settle = () => {
+        for (const p of body.querySelectorAll('p')) {
+          const attr = isAttribution({ text: p.textContent.trim() });
+          if (p.hasAttribute('data-attr') !== attr) p.toggleAttribute('data-attr', attr);
+        }
+      };
+      settle();
+      body.addEventListener('input', settle);
+    }
     // older marks used a "?" that read as a broken image — normalize to the flag
     body.querySelectorAll('.ph-mark').forEach((m) => { m.textContent = '⚑'; });
     // heal the engine's style-junk spans left by past merges and splits
@@ -1183,15 +2267,14 @@ function renderChapters() {
       if (tn.data.includes('\u00a0')) tn.data = tn.data.replace(/\u00a0/g, ' ');
     }
     wireChapterBody(body, chId);
-    sec.appendChild(head);
-    sec.appendChild(body);
-    wrap.appendChild(sec);
   });
   renderNav();
 }
 
 async function deleteChapterToDarlings(chId) {
   snapshotStructure('chapter delete');
+  const kind = chapterKind(chId);
+  const name = chapterName(chId);
   const index = book.chapterOrder.indexOf(chId);
   const text = chapterText(chId).trim();
   if (text) {
@@ -1201,24 +2284,61 @@ async function deleteChapterToDarlings(chId) {
       html: bodyEl ? bodyEl.innerHTML : chapterHTML[chId],
       text: text.slice(0, 2000),
       chapterId: null,
-      chapterLabel: t('deleted Chapter {n}', { n: index + 1 }),
+      chapterLabel: chapterKind(chId) !== 'chapter' ? chapterName(chId) : t('deleted Chapter {n}', { n: chapterNumber(chId) }),
       date: new Date().toISOString()
     });
     await window.neo.writeJSON(book.id, 'darlings', darlings);
   }
   if (currentChapterId === chId) currentChapterId = null;
   await deleteChapterQuiet(chId);
-  if (text) toast(t('Chapter removed — its words are in Darlings, or {key} to undo', { key: KZ }));
+  if (text) {
+    toast(kind === 'chapter'
+      ? t('Chapter removed — its words are in Darlings, or {key} to undo', { key: KZ })
+      : t('{name} removed — its words are in Darlings, or {key} to undo', { name, key: KZ }));
+  }
 }
 
-async function chapterMenu(chId, index) {
+// Right-click a chapter's box in the Chapters pane, its heading, or its
+// line in the outline: what it is (a chapter, a part, one of the pages a
+// book carries), or Delete. Resolves to the choice once it's made.
+async function chapterMenu(chId, x = 0, y = 0, from = null) {
+  const kind = chapterKind(chId);
   const words = countWords(chapterText(chId));
-  const choice = await optionModal(
-    t('Chapter {n}', { n: index + 1 }),
-    words ? t('{n} words.', { n: words }) : t('This chapter is empty.'),
-    [{ label: t('Delete chapter'), desc: words ? t('Its words move to Darlings, recoverable anytime.') : t('Nothing to save — it just goes.'), danger: true, value: 'delete' }]
-  );
-  if (choice === 'delete') await deleteChapterToDarlings(chId);
+  const otherContents = book.chapterOrder.some((c) => c !== chId && chapterKind(c) === 'contents');
+  const items = CHAPTER_KINDS.map((k) => ({
+    label: kindName(k),
+    value: k,
+    checked: k === kind,
+    // one contents per book, and never over words: it would hide them
+    disabled: k === 'contents' && k !== kind && (otherContents || words > 0)
+  }));
+  items.push('-', { label: t('Delete'), value: 'delete', danger: true });
+  const choice = await popMenu(x, y, items, { title: chapterName(chId), from: from || document.querySelector(`.nav-item[data-id="${chId}"] .n-row`) });
+  if (!choice || choice === kind) return null;
+  if (choice === 'delete') {
+    await deleteChapterToDarlings(chId);
+    if (currentTab === 'outline') renderOutline();
+    return choice;
+  }
+  snapshotStructure('chapter kind');
+  setChapterKind(chId, choice);
+  // a copyright page starts with what every copyright page says
+  if (choice === 'copyright' && !chapterText(chId).trim()) {
+    chapterHTML[chId] = copyrightStarter();
+    persistChapter(chId);
+  }
+  await saveMeta();
+  renderChapters();
+  if (currentTab === 'outline') renderOutline();
+  updateCounters();
+  return choice;
+}
+
+// Copyright © 2026 Hugh Howey / All rights reserved.
+function copyrightStarter() {
+  const name = (book && book.author) || library.authorName || t('Anonymous');
+  return `<p>${escHtml(t('Copyright © {year} {name}', { year: String(new Date().getFullYear()), name }))}</p>`
+    + `<p>${escHtml(t('All rights reserved.'))}</p>`;
 }
 
 /* ================================================================== */
@@ -1236,6 +2356,7 @@ function wireChapterBody(body, chId) {
     if (spellOn) scheduleSpellRescan(chId, body);
     updateCounters();
     scheduleNavRefresh();
+    if (!typewriterEnabled) revealCaret();
   });
   // paste without formatting
   body.addEventListener('paste', (e) => {
@@ -1323,9 +2444,21 @@ function wireChapterBody(body, chId) {
   });
 }
 
+// the contents have nothing to type in: going there is only looking
+function showEntry(chId) {
+  const sec = document.querySelector(`.chapter[data-id="${chId}"]`);
+  if (!sec) return;
+  if (document.activeElement && document.activeElement.isContentEditable) document.activeElement.blur();
+  sec.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
+  currentChapterId = chId;
+  highlightNav();
+  updateCounters();
+}
+
 function focusChapterStart(chId) {
   const nb = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
   if (!nb) return;
+  if (!nb.isContentEditable) { showEntry(chId); return; }
   nb.focus({ preventScroll: true });
   const nr = document.createRange();
   const first = nb.querySelector('p');
@@ -1375,6 +2508,45 @@ function styleKeepScroll(e) {
   return true;
 }
 
+// ⌥⌘↓ / ⌥⌘↑ (Ctrl+Alt on Windows and Linux): the start of the next or the
+// previous chapter, without opening the pane
+function gotoChapter(step) {
+  if (!book || $('#editor-view').hidden || !book.chapterOrder.length) return;
+  if (document.querySelector('.modal-backdrop:not([hidden])')) return;
+  if (currentTab !== 'manuscript') switchTab('manuscript');
+  const order = book.chapterOrder;
+  let at = order.indexOf(currentChapterId);
+  if (at < 0) at = step > 0 ? -1 : order.length;
+  const to = Math.max(0, Math.min(order.length - 1, at + step));
+  if (to === at) return;
+  const sec = document.querySelector(`.chapter[data-id="${order[to]}"]`);
+  if (!sec) return;
+  focusChapterStart(order[to]);
+  sec.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
+}
+
+// The caret never types out of sight: an Enter (or anything else) on the
+// window's bottom line brings the new line into view, with a little room
+// below it. (Typewriter scrolling keeps the line centered on its own.)
+function revealCaret() {
+  const sc = $('#paper-scroll');
+  const sel = window.getSelection();
+  if (!sc || !sel.rangeCount || !sc.contains(sel.anchorNode)) return;
+  const r = sel.getRangeAt(0).cloneRange();
+  r.collapse(false);
+  let rect = r.getBoundingClientRect();
+  if (!rect.height) {
+    // an empty line has no text to measure: its paragraph does
+    const node = r.endContainer.nodeType === Node.ELEMENT_NODE ? r.endContainer : r.endContainer.parentElement;
+    if (!node) return;
+    rect = node.getBoundingClientRect();
+  }
+  const box = sc.getBoundingClientRect();
+  const room = Math.min(48, box.height / 6);
+  if (rect.bottom > box.bottom - room) sc.scrollTop += rect.bottom - (box.bottom - room);
+  else if (rect.top < box.top + 8) sc.scrollTop -= box.top + 8 - rect.top;
+}
+
 // Backspace at the very start of a chapter swallows an empty chapter above it
 function chapterStartBackspace(e, body, chId) {
   if (e.key !== 'Backspace' || e.metaKey || e.ctrlKey || e.altKey) return false;
@@ -1389,9 +2561,12 @@ function chapterStartBackspace(e, body, chId) {
   if (idx <= 0) return false;
   const prevId = book.chapterOrder[idx - 1];
   const prevBody = document.querySelector(`.chapter[data-id="${prevId}"] .chapter-body`);
-  if (!prevBody) return false;
+  if (!prevBody || chapterKind(prevId) === 'contents') return false;
+  const empty = prevBody.innerText.trim() === '';
+  // only story runs into story: a page above stays a page
+  if (!empty && !(isStory(chId) && isStory(prevId))) return false;
   e.preventDefault();
-  if (prevBody.innerText.trim() === '') {
+  if (empty) {
     // empty chapter above: swallow it
     snapshotStructure('empty chapter removed');
     breakRun++;
@@ -1415,6 +2590,7 @@ function chapterStartBackspace(e, body, chId) {
   }
   if (book.chapterTitles) delete book.chapterTitles[chId];
   if (book.chapterNotes) delete book.chapterNotes[chId];
+  if (book.chapterKinds) delete book.chapterKinds[chId];
   book.chapterOrder = book.chapterOrder.filter((c) => c !== chId);
   delete chapterHTML[chId];
   window.neo.deleteChapter(book.id, chId);
@@ -1646,6 +2822,20 @@ function handleEnter(e, body, chId) {
   if (el.nodeType === Node.TEXT_NODE) el = el.parentElement;
   const block = el && el.closest ? el.closest('p') : null;
   if (!block || !body.contains(block)) return false;
+  // on a page (a dedication, a part, the copyright) Enter is only a new
+  // line: breaks and new chapters belong to the story
+  if (!isStory(chId) && !block.classList.contains('poetry')) {
+    e.preventDefault();
+    enterRun = 0;
+    if (block.querySelector('span:not(.ph-mark)')) {
+      const caret = captureCaret();
+      stripJunkSpans(block);
+      restoreCaret(caret);
+    }
+    document.execCommand('insertParagraph');
+    syncChapter(body, chId);
+    return true;
+  }
   if (block.classList.contains('scene-break')) { e.preventDefault(); return true; } // Enter on a *** line: nothing
   // Enter in a poetry paragraph steps back into prose: an empty line becomes
   // an ordinary paragraph in place; otherwise the line splits and the new
@@ -1964,7 +3154,8 @@ function sceneBreakDelete(e, body, chId) {
 
 // Read a body's HTML for saving:
 function captureBody(body) {
-  return body.innerHTML;
+  // (a page marks the lines that say who said it, for the screen only)
+  return body.innerHTML.replace(/(<p\b[^>]*?) data-attr=""/g, '$1');
 }
 
 function syncChapter(body, chId) {
@@ -2022,8 +3213,8 @@ document.addEventListener('selectionchange', () => {
 // spans — so every block boundary and <br> becomes a paragraph break, and
 // styling that only lives in a style attribute is read as bold/italic.
 function cleanPasteHtml(html) {
-  const holder = document.createElement('div');
-  holder.innerHTML = html;
+  // parsed off to the side: nothing in a clipboard loads or runs
+  const holder = new DOMParser().parseFromString(html, 'text/html').body;
   holder.querySelectorAll('script,style,meta,link,img,table,head,title').forEach((n) => n.remove());
   // Google Docs wraps the whole clipboard in <b style="font-weight:normal">
   holder.querySelectorAll('b, strong').forEach((b) => {
@@ -2132,8 +3323,11 @@ function smartKeys(e, body) {
   if (e.key === '"' || e.key === "'") {
     e.preventDefault();
     const before = prevChars(1);
-    const opening = before === '' || /[\s\(\[\{—‘“«„>]/.test(before);
-    const q = quoteStyle();
+    const q = e.key === '"' ? bookQuotes(body) : quoteStyle();
+    let opening = before === '' || /[\s\(\[\{‘“«„>]/.test(before);
+    // after a dash, a quote usually closes speech that was cut off ("I was
+    // just—"); it opens one only when no quotation is open in the paragraph
+    if (before === '—' || before === '–') opening = !quoteIsOpen(range, e.key === '"' ? q : { open: '‘', close: '’' });
     let ch;
     if (e.key === "'") {
       // most languages type ' as an apostrophe only; English and Dutch also
@@ -2144,6 +3338,30 @@ function smartKeys(e, body) {
     }
     document.execCommand('insertText', false, ch);
   }
+}
+
+// Is a quotation open at the caret, in the paragraph so far? Opening marks
+// against closing ones; an apostrophe (’ between two letters) is no quote.
+function quoteIsOpen(range, q) {
+  let el = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  const block = el && el.closest ? el.closest('p, div') : null;
+  if (!block) return false;
+  const pre = document.createRange();
+  pre.selectNodeContents(block);
+  try { pre.setEnd(range.startContainer, range.startOffset); } catch { return false; }
+  const text = pre.toString();
+  const open = q.open.trim();
+  const close = q.close.trim();
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === open && open !== close) depth++;
+    else if (c === close) {
+      if (close === '’' && /\p{L}/u.test(text[i - 1] || '') && /\p{L}/u.test(text[i + 1] || '')) continue;
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  return depth > 0;
 }
 
 // The quotation marks of the language being written: the spellcheck
@@ -2157,7 +3375,9 @@ const QUOTE_STYLES = {
   es: { open: '«', close: '»' },                          // RAE: « » first
   it: { open: '«', close: '»' },
   de: { open: '„', close: '“' },
-  pl: { open: '„', close: '”' }
+  pl: { open: '„', close: '”' },
+  ro: { open: '„', close: '”' },
+  ru: { open: '«', close: '»' }
 };
 function writingLanguage() {
   return (library && library.spellLanguage) || NeoI18n.getLocale();
@@ -2165,6 +3385,25 @@ function writingLanguage() {
 function quoteStyle() {
   const code = writingLanguage();
   return QUOTE_STYLES[code] || QUOTE_STYLES[code.split('-')[0]] || QUOTE_STYLES.en;
+}
+// …unless the book has settled on guillemets its language doesn't use:
+// German novels often set »…« where the language says „…“, Swiss writing
+// «…». Whichever mark opens the most quotes wins — in this chapter, or in
+// the book when the chapter has none yet — so a » typed by hand once is
+// enough to carry on in that style.
+function bookQuotes(el) {
+  const q = quoteStyle();
+  const opens = (text) => {
+    const n = (re) => (text.match(re) || []).length;
+    const own = q.open.trim();
+    return { '»': n(/»(?=[\p{L}\p{N}])/gu), '«': own === '«' ? 0 : n(/«(?=[\p{L}\p{N}])/gu), own: n(new RegExp(own + '\\s?(?=[\\p{L}\\p{N}])', 'gu')) };
+  };
+  const body = el && el.closest ? el.closest('.chapter-body') : null;
+  let c = opens(body ? body.textContent : '');
+  if (!c['»'] && !c['«'] && !c.own && book) c = opens(book.chapterOrder.map((id) => chapterHTML[id] || '').join(' '));
+  if (c['»'] > c.own && c['»'] >= c['«']) return { open: '»', close: '«' };
+  if (c['«'] > c.own && c['«'] > c['»']) return { open: '«', close: '»' };
+  return q;
 }
 
 // French typographic rules apply when the book is spellchecked in French,
@@ -2190,11 +3429,10 @@ $('#tp-subtitle').addEventListener('keydown', titleEnter);
 function titleEnter(e) {
   if (e.key !== 'Enter') return;
   e.preventDefault();
-  if (book.chapterOrder.length === 0) {
-    newChapter();
-  } else {
-    focusChapter(book.chapterOrder[0]);
-  }
+  // into the story, past any pages that come before it
+  const first = book.chapterOrder.find((c) => isStory(c));
+  if (first) focusChapter(first);
+  else focusChapter(createChapterAt(storyEnd()));
 }
 $('#tp-title').addEventListener('input', () => {
   book.title = $('#tp-title').textContent.trim() || t('Untitled');
@@ -2279,6 +3517,7 @@ async function deleteChapterQuiet(chId) {
   delete wordCache[chId];
   if (book.sectionNotes) delete book.sectionNotes[chId];
   if (book.chapterNotes) delete book.chapterNotes[chId];
+  if (book.chapterKinds) delete book.chapterKinds[chId];
   stickies = stickies.filter((s) => s.chapterId !== chId);
   window.neo.writeJSON(book.id, 'stickies', stickies);
   window.neo.deleteChapter(book.id, chId);
@@ -2290,6 +3529,7 @@ async function deleteChapterQuiet(chId) {
 function focusChapter(chId) {
   const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
   if (!body) return;
+  if (!body.isContentEditable) { showEntry(chId); return; }
   body.focus();
   // caret at the very end
   const range = document.createRange();
@@ -2298,7 +3538,7 @@ function focusChapter(chId) {
   const sel = window.getSelection();
   sel.removeAllRanges();
   sel.addRange(range);
-  body.closest('.chapter').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  body.closest('.chapter').scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
   currentChapterId = chId;
   highlightNav();
 }
@@ -2361,7 +3601,7 @@ function returnToMark(sid) {
   const scroller = $('#paper-scroll');
   const r = mark.getBoundingClientRect();
   const sr = scroller.getBoundingClientRect();
-  if (r.top < sr.top + 40 || r.bottom > sr.bottom - 40) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  if (r.top < sr.top + 40 || r.bottom > sr.bottom - 40) mark.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
   if (!bodyEl) return;
   currentChapterId = bodyEl.closest('.chapter').dataset.id;
   bodyEl.focus({ preventScroll: true });
@@ -2390,15 +3630,14 @@ function renderStickies() {
     el.className = 'sticky unresolved';
     el.dataset.sid = s.id;
     el.innerHTML = `
-      <div class="s-ch">${chIdx >= 0 ? t('Chapter {n}', { n: chIdx + 1 }) : t('Unplaced')}</div>
+      <div class="s-ch">${chIdx >= 0 ? chapterName(s.chapterId) : t('Unplaced')}</div>
       <textarea placeholder="${t('What needs doing here?')}" spellcheck="false"></textarea>
       <div class="s-actions"><button class="s-go">${t('Go to')}</button><span class="s-sep">·</span><button class="s-done">${t('Resolve')}</button></div>`;
     const ta = el.querySelector('textarea');
     ta.value = s.text;
     ta.addEventListener('input', () => {
       s.text = ta.value;
-      clearTimeout(saveTimers.stickies);
-      saveTimers.stickies = setTimeout(() => window.neo.writeJSON(book.id, 'stickies', stickies), 600);
+      scheduleStickiesSave();
     });
     ta.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' || e.shiftKey) return; // Shift+Enter: another line in the note
@@ -2412,6 +3651,27 @@ function renderStickies() {
     el.querySelector('.s-done').onclick = () => resolveSticky(s.id);
     wrap.appendChild(el);
   }
+}
+
+// A note is saved a moment after the last keystroke. The save belongs to the
+// book it was typed in: leaving the book (Esc to the shelf) writes it at once
+// instead of letting the timer find no book, which lost the note's text.
+function scheduleStickiesSave() {
+  if (!book) return;
+  const bookId = book.id;
+  const list = stickies;
+  clearTimeout(saveTimers.stickies);
+  saveTimers.stickies = setTimeout(() => {
+    delete saveTimers.stickies;
+    window.neo.writeJSON(bookId, 'stickies', list);
+  }, 600);
+}
+
+function flushStickiesSave() {
+  if (!saveTimers.stickies || !book) return;
+  clearTimeout(saveTimers.stickies);
+  delete saveTimers.stickies;
+  window.neo.writeJSON(book.id, 'stickies', stickies);
 }
 
 // Pair every mark in the manuscript with a note: pasted duplicates get their
@@ -2496,20 +3756,47 @@ function renderNav() {
   if (chapterDragActive) { navRefreshPending = true; return; }
   navRefreshPending = false;
   const list = $('#nav-list');
+  // a keyboard user on a chapter row keeps their place through the rebuild
+  const focusedRow = document.activeElement && document.activeElement.classList.contains('n-row') &&
+    document.activeElement.matches(':focus-visible') ? document.activeElement.closest('.nav-item').dataset.id : null;
   list.innerHTML = '';
   book.chapterNotes = book.chapterNotes || {};
+  const solo = soloStory();
+  // the book from top to bottom: a faint + between the boxes (and above and
+  // below them) adds a chapter, a part or a page right there
+  const gap = (at) => {
+    const g = document.createElement('div');
+    g.className = 'nav-gap';
+    const plus = document.createElement('button');
+    plus.className = 'ng-plus';
+    plus.tabIndex = -1;
+    plus.textContent = '+';
+    plus.setAttribute('aria-label', t('Add'));
+    const add = (e) => { e.preventDefault(); e.stopPropagation(); addEntryMenu(at, e.clientX, e.clientY, plus); };
+    plus.addEventListener('click', add);
+    plus.addEventListener('contextmenu', add);
+    g.appendChild(plus);
+    return g;
+  };
+  let inPart = false;
   book.chapterOrder.forEach((chId, i) => {
-    const words = chapterWords(chId);
+    const kind = chapterKind(chId);
+    const story = STORY_KINDS.includes(kind);
+    // a part gathers what follows it, up to the next part or the back of the book
+    if (kind === 'part') inPart = true;
+    else if (BACK_KINDS.includes(kind)) inPart = false;
+    const words = story ? chapterWords(chId) : 0;
     const flagged = !!document.querySelector(`.chapter[data-id="${chId}"] .ph-mark`);
-    const chTitle = (book.chapterTitles || {})[chId];
+    const chTitle = story ? (book.chapterTitles || {})[chId] : '';
     const item = document.createElement('div');
-    item.className = 'nav-item' + (chId === currentChapterId ? ' current' : '');
+    item.className = `nav-item kind-${kind}` + (story ? '' : ' nav-page') + (inPart && kind !== 'part' ? ' in-part' : '') +
+      (chId === currentChapterId ? ' current' : '') + (chId === justAddedEntry ? ' just-added' : '');
     item.dataset.id = chId;
     item.innerHTML = `<div class="n-row" title="${t('Drag to reorder chapters')}"><span class="n-label"></span>
-      <span style="display:flex;align-items:center"><span class="n-words">${fmtNum(words)}</span>${flagged ? `<span class="n-flag" title="${t('Unresolved placeholder')}"></span>` : ''}</span></div>`;
-    item.querySelector('.n-label').textContent = book.chapterOrder.length === 1
+      <span style="display:flex;align-items:center">${story ? `<span class="n-words">${fmtNum(words)}</span>` : ''}${flagged ? `<span class="n-flag" title="${t('Unresolved placeholder')}"></span>` : ''}</span></div>`;
+    item.querySelector('.n-label').textContent = chId === solo
       ? (book.title || t('The story'))
-      : (chTitle ? `${i + 1} · ${chTitle}` : t('Chapter {n}', { n: i + 1 }));
+      : (chTitle ? `${chapterMark(chId)} · ${chTitle}` : chapterName(chId));
 
     // the row is the drag handle, so the note below stays freely editable
     const rowEl = item.querySelector('.n-row');
@@ -2521,40 +3808,173 @@ function renderNav() {
       item.classList.add('dragging');
     });
     rowEl.addEventListener('dragend', finishChapterDrag);
+    // right-click: what it is, or Delete
+    item.addEventListener('contextmenu', (e) => {
+      if (e.target.closest('.nav-note[contenteditable="true"]')) return; // the note's own text menu
+      e.preventDefault();
+      chapterMenu(chId, e.clientX, e.clientY, rowEl);
+    });
 
-    // outline your whole book from this panel:
-    const note = document.createElement('div');
-    note.className = 'nav-note';
-    note.contentEditable = 'true';
-    note.spellcheck = false;
-    note.textContent = book.chapterNotes[chId] || '';
-    note.addEventListener('click', (e) => e.stopPropagation());
-    note.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); note.blur(); }
-      e.stopPropagation();
-    });
-    note.addEventListener('blur', () => {
-      book.chapterNotes[chId] = note.textContent.trim();
-      scheduleMetaSave();
-    });
-    item.appendChild(note);
+    if (story) {
+      // outline your whole book from this panel:
+      const note = document.createElement('div');
+      note.className = 'nav-note';
+      note.contentEditable = 'true';
+      note.spellcheck = false;
+      note.textContent = book.chapterNotes[chId] || '';
+      note.setAttribute('role', 'textbox');
+      note.setAttribute('aria-label', t('Outline note'));
+      note.setAttribute('aria-placeholder', t('What happens here…'));
+      note.addEventListener('click', (e) => e.stopPropagation());
+      note.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); note.blur(); }
+        e.stopPropagation();
+      });
+      note.addEventListener('blur', () => {
+        book.chapterNotes[chId] = note.textContent.trim();
+        scheduleMetaSave();
+      });
+      item.appendChild(note);
+    } else if (kind !== 'contents') {
+      // a page shows the start of what it says
+      const peek = document.createElement('div');
+      peek.className = 'nav-note nav-peek';
+      peek.textContent = entryPeek(chId);
+      if (!peek.textContent && PAGE_PROMPTS[kind]) { peek.dataset.ph = PAGE_PROMPTS[kind](); peek.classList.add('blank'); }
+      item.appendChild(peek);
+    }
 
     item.onclick = () => {
       switchTab('manuscript');
       focusChapter(chId);
     };
+    // from the keyboard, the row is the chapter's button (F6 reaches the pane)
+    pressable(rowEl, [
+      item.querySelector('.n-label').textContent,
+      story ? t('{n} words', { n: words }) : '',
+      flagged ? t('Unresolved placeholder') : ''
+    ].filter(Boolean).join(', '));
+    list.appendChild(gap(i));
     list.appendChild(item);
+    if (chId === focusedRow) rowEl.focus({ preventScroll: true });
   });
+  list.appendChild(gap(book.chapterOrder.length));
+  justAddedEntry = null;
+  renderContentsLists();
 }
 
+// the first words of a page, for its box in the Chapters pane
+function entryPeek(chId) {
+  const el = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+  const holder = document.createElement('template');
+  holder.innerHTML = el ? el.innerHTML : (chapterHTML[chId] || '');
+  const first = [...holder.content.querySelectorAll('p:not(.ghost):not(.scene-break)')].map((p) => p.textContent.trim()).find(Boolean);
+  return first || '';
+}
+
+// The + between two boxes: which kind, then it's there, in place
+let justAddedEntry = null;
+async function addEntryMenu(at, x, y, from) {
+  const hasContents = book.chapterOrder.some((c) => chapterKind(c) === 'contents');
+  const kind = await popMenu(x, y, CHAPTER_KINDS.map((k) => ({ label: kindName(k), value: k, disabled: k === 'contents' && hasContents })), { from });
+  if (!kind) return;
+  addEntry(at, kind);
+}
+function addEntry(at, kind) {
+  switchTab('manuscript');
+  snapshotStructure('add ' + kind);
+  const chId = newEntryId();
+  justAddedEntry = chId;
+  book.chapterOrder.splice(at, 0, chId);
+  setChapterKind(chId, kind);
+  chapterHTML[chId] = kind === 'copyright' ? copyrightStarter() : '<p><br></p>';
+  persistChapter(chId);
+  saveMeta();
+  renderChapters();
+  // the new page is ready to write on (the contents, to look at)
+  if (kind === 'copyright') focusChapter(chId); else focusChapterStart(chId);
+  document.querySelector(`.chapter[data-id="${chId}"]`).scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
+  updateCounters();
+  if (currentTab === 'outline') renderOutline();
+  return chId;
+}
+const newEntryId = () => 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+
+// The contents, in the manuscript: the parts, the chapters and the pages at
+// the back, as the reader will find them, each one a way there
+function bookContents(meta = book) {
+  const solo = soloStory(meta);
+  const out = [];
+  let inPart = false;
+  for (const chId of meta.chapterOrder) {
+    const kind = chapterKind(chId, meta);
+    if (kind === 'part') inPart = true;
+    else if (BACK_KINDS.includes(kind)) inPart = false;
+    if (['copyright', 'dedication', 'epigraph', 'contents'].includes(kind) || chId === solo) continue;
+    let label = chapterName(chId, meta);
+    const title = STORY_KINDS.includes(kind) ? ((meta.chapterTitles || {})[chId] || '') : '';
+    if (kind === 'part') {
+      const partTitle = partTitleOf(chId);
+      if (partTitle) label += ': ' + partTitle;
+    } else if (title) label = library.exportCustomChapterTitles && kind === 'chapter' ? title : label + ' — ' + title;
+    out.push({ chId, label, type: kind === 'part' ? 'part' : STORY_KINDS.includes(kind) ? 'chapter' : 'page', level: inPart && kind !== 'part' ? 1 : 0 });
+  }
+  return out;
+}
+// a part's title is the first line of its page (what follows is its quote)
+function partTitleOf(chId) {
+  const el = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+  const paras = parasFromHtml(el ? el.innerHTML : (chapterHTML[chId] || ''));
+  return paras[0] && !paras[0].sceneBreak && !isAttribution(paras[0]) ? paras[0].text : '';
+}
+function renderContentsLists() {
+  const lists = $$('#chapters .toc-list');
+  if (!lists.length) return;
+  const entries = bookContents();
+  for (const list of lists) {
+    list.innerHTML = '';
+    for (const e of entries) {
+      const li = document.createElement('li');
+      li.className = `t-${e.type} lv${e.level}`;
+      li.textContent = e.label;
+      li.onclick = () => focusChapterStart(e.chId);
+      list.appendChild(li);
+    }
+  }
+}
+
+// A new chapter goes at the end of the story: after the last chapter, and
+// before an epilogue and the pages at the back
+function storyEnd() {
+  const order = book.chapterOrder;
+  const last = order.map((c) => chapterKind(c)).lastIndexOf('chapter');
+  if (last >= 0) return last + 1;
+  let at = order.length;
+  while (at > 0 && BACK_KINDS.includes(chapterKind(order[at - 1]))) at--;
+  return at;
+}
 $('#nav-add').onclick = () => {
   switchTab('manuscript');
-  currentChapterId = book.chapterOrder[book.chapterOrder.length - 1] || null;
-  newChapter();
+  focusChapter(createChapterAt(storyEnd()));
 };
 
 // drop target for chapter reordering, with a gold line showing the landing spot
 const navList = $('#nav-list');
+// the + on the seam nearest the pointer, when it's near one (the pane
+// listens, so the seams above the first box and below the last wake too)
+$('#nav-pane').addEventListener('mousemove', (e) => {
+  if (chapterDragActive || e.buttons) return;
+  let near = null;
+  let best = 9;
+  for (const g of navList.querySelectorAll('.nav-gap')) {
+    const d = Math.abs(e.clientY - g.getBoundingClientRect().top);
+    if (d < best) { best = d; near = g; }
+  }
+  for (const g of navList.querySelectorAll('.nav-gap')) g.classList.toggle('near', g === near);
+});
+$('#nav-pane').addEventListener('mouseleave', () => {
+  navList.querySelectorAll('.nav-gap.near').forEach((g) => g.classList.remove('near'));
+});
 function finishChapterDrag(e) {
   if (!chapterDragActive) return;
   chapterDragActive = false;
@@ -2565,7 +3985,7 @@ function finishChapterDrag(e) {
   // to keep the pane available after an in-pane drop, even before focus returns.
   const pane = $('#nav-pane');
   const r = pane.getBoundingClientRect();
-  if (e.clientX < r.left || e.clientX >= r.right || e.clientY < r.top || e.clientY >= r.bottom) {
+  if (pane.dataset.pinned !== '1' && (e.clientX < r.left || e.clientX >= r.right || e.clientY < r.top || e.clientY >= r.bottom)) {
     pane.classList.remove('open');
   }
   if (navRefreshPending) renderNav();
@@ -2639,8 +4059,9 @@ function scheduleNavRefresh() {
 
 // Hover behavior for both side panes:
 function wireHoverPane(hotzone, pane, isPinnable) {
+  // (a menu opened from the Chapters pane keeps it open while it's up)
   const pinned = () => (isPinnable && pane.dataset.pinned === '1') ||
-    (pane.id === 'nav-pane' && chapterDragActive);
+    (pane.id === 'nav-pane' && (chapterDragActive || !!document.querySelector('.pop-menu')));
   hotzone.addEventListener('mouseenter', (e) => {
     if (e.buttons) return; // dragging something — stand down
     pane.classList.add('open');
@@ -2655,13 +4076,13 @@ function wireHoverPane(hotzone, pane, isPinnable) {
     pane.classList.remove('open');
   });
 }
-wireHoverPane($('#nav-hotzone'), $('#nav-pane'), false);
+wireHoverPane($('#nav-hotzone'), $('#nav-pane'), true);
 wireHoverPane($('#side-hotzone'), $('#side-pane'), true);
 
 // leaving the window closes unpinned panes (they used to stick open)
 function closeUnpinnedPanes() {
   // Wayland can blur the window as a native chapter drag begins.
-  if (!chapterDragActive) $('#nav-pane').classList.remove('open');
+  if (!chapterDragActive && $('#nav-pane').dataset.pinned !== '1') $('#nav-pane').classList.remove('open');
   if ($('#side-pane').dataset.pinned !== '1') $('#side-pane').classList.remove('open');
 }
 document.documentElement.addEventListener('mouseleave', closeUnpinnedPanes);
@@ -2677,14 +4098,31 @@ $('#editor-view').addEventListener('wheel', (e) => {
   scroller.scrollTop += e.deltaY;
 }, { passive: true });
 
-$('#side-pin').onclick = () => {
-  const pane = $('#side-pane');
-  const pinned = pane.dataset.pinned === '1';
-  pane.dataset.pinned = pinned ? '0' : '1';
-  $('#side-pin').classList.toggle('pinned', !pinned);
-  $('#editor-view').classList.toggle('side-pinned', !pinned);
-  if (!pinned) pane.classList.add('open');
-};
+// Keep Open, on either pane: the page moves over to make room, and the
+// choice stays for next time (on this computer)
+function pinPane(side, on) {
+  const pane = $(side === 'nav' ? '#nav-pane' : '#side-pane');
+  const pin = $(side === 'nav' ? '#nav-pin' : '#side-pin');
+  pane.dataset.pinned = on ? '1' : '0';
+  pin.classList.toggle('pinned', on);
+  pin.setAttribute('aria-pressed', on ? 'true' : 'false');
+  $('#editor-view').classList.toggle(side + '-pinned', on);
+  if (on) pane.classList.add('open');
+  try {
+    const kept = JSON.parse(localStorage.getItem('neo-pinned-panes') || '{}');
+    kept[side] = on;
+    localStorage.setItem('neo-pinned-panes', JSON.stringify(kept));
+  } catch { /* fine: it just won't be remembered */ }
+}
+$('#side-pin').onclick = () => pinPane('side', $('#side-pane').dataset.pinned !== '1');
+$('#nav-pin').onclick = () => pinPane('nav', $('#nav-pane').dataset.pinned !== '1');
+if (!NO_HOVER) {
+  try {
+    const kept = JSON.parse(localStorage.getItem('neo-pinned-panes') || '{}');
+    if (kept.nav) pinPane('nav', true);
+    if (kept.side) pinPane('side', true);
+  } catch { /* nothing kept */ }
+}
 
 /* ================================================================== */
 /*  TABS — Manuscript / Notes / Outline / Darlings                     */
@@ -2703,7 +4141,7 @@ $$('.tab').forEach((tab) => {
     // Renamed tabs become the default for future books
     library.tabDefaults = library.tabDefaults || {};
     library.tabDefaults[kind] = name;
-    window.neo.writeLibrary(library);
+    writeLibrary(library);
   });
 });
 
@@ -2852,7 +4290,7 @@ async function moveSelectionToDarlings(html, text) {
     html: cleanHtml,
     text: text,
     chapterId: chId || null,
-    chapterLabel: chIdx >= 0 ? t('Chapter {n}', { n: chIdx + 1 }) : t('Manuscript'),
+    chapterLabel: chIdx >= 0 ? chapterName(chId) : t('Manuscript'),
     anchorPrefix,
     anchorSuffix,
     date: new Date().toISOString()
@@ -2922,7 +4360,10 @@ function switchTab(name) {
       : { scroll: scroller.scrollTop };
   }
   currentTab = name;
-  $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  $$('.tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.tab === name);
+    t.setAttribute('aria-selected', t.dataset.tab === name ? 'true' : 'false');
+  });
   if (spellOn) setTimeout(scanSpellingHere, 0);
   const paper = $('#paper');
   const aux = $('#aux-paper');
@@ -2935,11 +4376,14 @@ function switchTab(name) {
   // stash whatever aux content was open
   flushAux();
 
+  // an open Find follows the tab (Notes arrives from disk, so it looks later)
+  const findHere = () => { if (!$('#searchbar').hidden) runSearch(); };
   if (name === 'manuscript') {
     paper.hidden = false;
     aux.hidden = true;
     if (back && back.caret) restoreCaret(back.caret); // brings the scroll along
     else returnTo();
+    findHere();
     return;
   }
   paper.hidden = true;
@@ -2953,12 +4397,14 @@ function switchTab(name) {
     dList.hidden = false;
     renderDarlings();
     returnTo();
+    findHere();
   } else if (name === 'outline') {
     $('#aux-title').textContent = tabName('outline');
     oList.hidden = false;
-    if (book.chapterOrder.length === 0) createChapterAt(0);
+    if (!book.chapterOrder.some((c) => isStory(c))) createChapterAt(storyEnd());
     renderOutline();
     returnTo();
+    findHere();
   } else {
     $('#aux-title').textContent = tabName(name);
     auxEditor.hidden = false;
@@ -2967,6 +4413,7 @@ function switchTab(name) {
       auxEditor.innerHTML = html || '';
       auxEditor.focus({ preventScroll: true });
       returnTo();
+      findHere();
     });
   }
 }
@@ -2985,8 +4432,13 @@ function renderOutline(focusTarget) {
   const wrap = $('#outline-list');
   wrap.innerHTML = '';
 
+  // the story's lines, with each part standing over its chapters (the pages
+  // a book carries have nothing to outline)
   book.chapterOrder.forEach((chId, i) => {
-    wrap.appendChild(outlineLine('chapter', chId, null, i, String(i + 1),
+    const kind = chapterKind(chId);
+    if (kind === 'part') { wrap.appendChild(outlinePartLine(chId)); return; }
+    if (!STORY_KINDS.includes(kind)) return;
+    wrap.appendChild(outlineLine('chapter', chId, null, i, chapterMark(chId),
       book.chapterNotes[chId] || ''));
     (book.sectionNotes[chId] || []).forEach((sec, j) => {
       wrap.appendChild(outlineLine('section', chId, sec.id, j, secLetter(j), sec.text));
@@ -3016,6 +4468,30 @@ function renderOutline(focusTarget) {
   }
 }
 
+// a part in the outline: its name and title, over the chapters it holds
+function outlinePartLine(chId) {
+  const line = document.createElement('div');
+  line.className = 'ol-line ol-part';
+  line.dataset.chId = chId;
+  const num = document.createElement('span');
+  num.className = 'ol-num';
+  num.textContent = chapterMark(chId);
+  const name = document.createElement('div');
+  name.className = 'ol-part-name';
+  const title = partTitleOf(chId);
+  name.textContent = chapterName(chId) + (title ? ': ' + title : '');
+  line.append(num, name);
+  line.addEventListener('contextmenu', (e) => { e.preventDefault(); chapterMenu(chId, e.clientX, e.clientY, line); });
+  return line;
+}
+
+// the story entry before this one (pages and parts aren't where sections go)
+function storyBefore(chId) {
+  const order = book.chapterOrder;
+  for (let i = order.indexOf(chId) - 1; i >= 0; i--) if (isStory(order[i])) return order[i];
+  return null;
+}
+
 function outlineLine(kind, chId, secId, index, label, text) {
   const line = document.createElement('div');
   line.className = 'ol-line ol-' + kind;
@@ -3024,6 +4500,7 @@ function outlineLine(kind, chId, secId, index, label, text) {
   const num = document.createElement('span');
   num.className = 'ol-num';
   num.textContent = label;
+  if (kind === 'chapter' && chapterKind(chId) !== 'chapter') num.title = chapterName(chId);
   const txt = document.createElement('div');
   txt.className = 'ol-text';
   txt.contentEditable = 'true';
@@ -3096,14 +4573,13 @@ function outlineLine(kind, chId, secId, index, label, text) {
     if (e.key === 'Tab' && !e.shiftKey) {
       e.preventDefault();
       if (kind !== 'chapter') return;
-      const pos = book.chapterOrder.indexOf(chId);
-      if (pos === 0) { toast(t('The first line has to be a chapter')); return; }
+      const prevCh = storyBefore(chId);
+      if (!prevCh) { toast(t('The first line has to be a chapter')); return; }
       if (countWords(chapterText(chId)) > 0) {
         toast(t('This chapter already has words in it — only empty chapter lines can become sections'));
         return;
       }
       save();
-      const prevCh = book.chapterOrder[pos - 1];
       book.sectionNotes[prevCh] = book.sectionNotes[prevCh] || [];
       const newSec = { id: 'sec-' + Date.now().toString(36), text: txt.textContent.trim() };
       book.sectionNotes[prevCh].push(newSec);
@@ -3134,9 +4610,8 @@ function outlineLine(kind, chId, secId, index, label, text) {
         scheduleMetaSave();
         syncGhosts(chId);
         renderOutline({ chId });
-      } else if (book.chapterOrder.length > 1 && countWords(chapterText(chId)) === 0) {
-        const pos = book.chapterOrder.indexOf(chId);
-        const prevCh = book.chapterOrder[Math.max(0, pos - 1)];
+      } else if (book.chapterOrder.filter((c) => isStory(c)).length > 1 && countWords(chapterText(chId)) === 0) {
+        const prevCh = storyBefore(chId) || book.chapterOrder.find((c) => c !== chId && isStory(c));
         deleteChapterQuiet(chId).then(() => renderOutline({ chId: prevCh }));
       }
     }
@@ -3147,17 +4622,7 @@ function outlineLine(kind, chId, secId, index, label, text) {
   line.addEventListener('contextmenu', async (e) => {
     e.preventDefault();
     if (kind === 'chapter') {
-      const i = book.chapterOrder.indexOf(chId);
-      const words = countWords(chapterText(chId));
-      const choice = await optionModal(
-        t('Chapter {n}', { n: i + 1 }),
-        words ? t('{n} words.', { n: words }) : t('This chapter is empty.'),
-        [{ label: t('Delete chapter'), desc: words ? t('Its words move to Darlings, recoverable anytime.') : t('Nothing to save — it just goes.'), danger: true, value: 'delete' }]
-      );
-      if (choice === 'delete') {
-        await deleteChapterToDarlings(chId);
-        renderOutline();
-      }
+      await chapterMenu(chId, e.clientX, e.clientY, line);
     } else {
       const choice = await optionModal(t('Delete this section?'), null,
         [{ label: t('Delete section'), desc: t('Removes the outline line and its gray ghost from the manuscript. Written prose is never touched.'), danger: true, value: 'delete' }]);
@@ -3323,7 +4788,7 @@ async function restoreDarling(id) {
         syncChapter(body, d.chapterId);
         darlings = darlings.filter((x) => x.id !== id);
         await window.neo.writeJSON(book.id, 'darlings', darlings);
-        scrollTo.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        scrollTo.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
         toast(t('Darling restored to its original spot'));
         return;
       }
@@ -3350,28 +4815,32 @@ async function restoreDarling(id) {
 /*  COUNTERS                                                           */
 /* ================================================================== */
 
+// the story's words: the pages a book carries don't count
 function bookWordCount() {
-  return book.chapterOrder.reduce((sum, chId) => sum + chapterWords(chId), 0);
+  return book.chapterOrder.reduce((sum, chId) => sum + (isStory(chId) ? chapterWords(chId) : 0), 0);
 }
 
 function updateCounters() {
   if (!book) return;
   const total = bookWordCount();
   const wc = $('#word-counter');
-  if (wordMode === 'book') {
-    wc.textContent = t('{n} words', { n: total });
-  } else {
-    const n = currentChapterId ? chapterWords(currentChapterId) : 0;
-    const idx = book.chapterOrder.indexOf(currentChapterId);
-    wc.textContent = t('ch. {ch}: {n} words', { ch: idx + 1, n });
+  if (wordMode === 'book') wc.textContent = t('{n} words', { n: total });
+  const cur = book.chapterOrder.includes(currentChapterId) ? currentChapterId : null;
+  const solo = soloStory();
+  if (wordMode !== 'book') {
+    const n = cur ? chapterWords(cur) : 0;
+    wc.textContent = cur && chapterKind(cur) !== 'chapter'
+      ? t('{name}: {n} words', { name: chapterName(cur), n })
+      : t('ch. {ch}: {n} words', { ch: cur ? chapterNumber(cur) : 0, n });
   }
   const pos = $('#pos-counter');
-  const idx = book.chapterOrder.indexOf(currentChapterId);
-  pos.textContent = book.chapterOrder.length <= 1
-    ? '' // a chapterless story needs no chapter locator
-    : (idx >= 0
-      ? t('chapter {ch} of {total}', { ch: idx + 1, total: book.chapterOrder.length })
-      : t('{n} chapters', { n: book.chapterOrder.length }));
+  pos.textContent = !cur
+    ? (numberedChapters() > 1 ? t('{n} chapters', { n: numberedChapters() }) : '')
+    : cur === solo
+      ? '' // a chapterless story needs no chapter locator
+      : chapterKind(cur) !== 'chapter'
+        ? chapterName(cur)
+        : t('chapter {ch} of {total}', { ch: chapterNumber(cur), total: numberedChapters() });
   // cache for the bookshelf progress bar
   if (book.wordCount !== total) {
     // only a true crossing earns a painting — a story that was already long
@@ -3476,14 +4945,27 @@ $('#paper-scroll').addEventListener('scroll', () => {
 function persistChapter(chId, html) {
   if (!book) return Promise.resolve(false);
   if (html === undefined) html = chapterHTML[chId] || '';
+  const before = savedHTML[chId];
   savedHTML[chId] = html;
-  return window.neo.writeChapter(book.id, chId, html);
+  writing[chId] = (writing[chId] || 0) + 1;
+  return new Promise((resolve) => resolve(window.neo.writeChapter(book.id, chId, html))).catch((err) => {
+    // It never reached the disk. Book it as unsaved again, so the next flush
+    // tries once more, and so a look at the disk can't take the old file
+    // for news and put it back on the page.
+    if (savedHTML[chId] === html) savedHTML[chId] = before;
+    throw err;
+  }).finally(() => { writing[chId]--; });
 }
 
 function scheduleChapterSave(chId) {
   clearTimeout(saveTimers[chId]);
+  const bookId = book && book.id;
   saveTimers[chId] = setTimeout(() => {
     if (!book) return; // the book closed before the timer fired; flushAllSaves already wrote it
+    // another book is open, or the chapter was deleted or merged into the one
+    // above while this save waited: its words are already where they belong,
+    // and writing now would only leave an empty stray file in chapters/
+    if (book.id !== bookId || !book.chapterOrder.includes(chId)) return;
     persistChapter(chId);
   }, 800);
 }
@@ -3511,7 +4993,7 @@ function scheduleMetaSave() {
 async function saveMeta() {
   if (!book) return;
   const sig = metaSig(book);
-  const stamp = await window.neo.writeBookMeta(book.id, book);
+  const stamp = await writeBookMeta(book.id, book);
   if (book && typeof stamp === 'string') book.modified = stamp;
   savedMetaSig = sig;
 }
@@ -3529,6 +5011,7 @@ function flushAllSaves() {
     }
   }
   flushAux();
+  flushStickiesSave();
   if (moved || metaSig(book) !== savedMetaSig) saveMeta();
 }
 
@@ -3542,14 +5025,35 @@ function flushAllSaves() {
 /*  nothing is ever lost quietly.                                      */
 /* ================================================================== */
 
+// True when the disk copy of a chapter has no word the page lacks, but the
+// page has words it lacks: an older copy, not an edit made somewhere else.
+function onlyDrops(page, disk) {
+  const bag = (html) => {
+    const m = new Map();
+    for (const w of String(html || '').replace(/<[^>]*>/g, ' ').split(/\s+/)) if (w) m.set(w, (m.get(w) || 0) + 1);
+    return m;
+  };
+  const here = bag(page);
+  const there = bag(disk);
+  for (const [w, n] of there) if (n > (here.get(w) || 0)) return false;
+  for (const [w, n] of here) if (n > (there.get(w) || 0)) return true;
+  return false;
+}
+
 let refreshing = false;
 async function refreshFromDisk() {
   if (refreshing) return;
   refreshing = true;
+  bookMetaCache.clear(); // whatever another device wrote, the next redraw reads
   try {
     if (!book) {
       if (library && !$('#bookshelf-view').hidden) {
+        const gen = libraryGeneration;
         const lib = await window.neo.readLibrary();
+        // a change made here while that read was out (a new shelf, a rename)
+        // is newer than what came back: taking it would undo the change,
+        // and the next save would make that stick. Look again next time.
+        if (gen !== libraryGeneration || libraryWritesPending) return;
         if (lib && lib.firstRunDone && JSON.stringify(lib) !== JSON.stringify(library)) {
           library = lib;
           const shelf = $('#bookshelf-view');
@@ -3564,31 +5068,109 @@ async function refreshFromDisk() {
     if (window.neo.refreshBook) await window.neo.refreshBook(bookId);
     const meta = await window.neo.readBookMeta(bookId);
     if (!book || book.id !== bookId || !meta) return;
-    const localDirty = book.chapterOrder.some((c) => chapterHTML[c] !== savedHTML[c]) ||
-      metaSig(book) !== savedMetaSig;
-    if (metaSig(meta) !== savedMetaSig) {
-      if (localDirty) return; // both sides restructured; ours stands, next save wins
-      // the other device added, renamed or moved chapters: reopen in place
-      const pos = { chapterId: currentChapterId, scroll: $('#paper-scroll').scrollTop };
-      const tab = currentTab;
-      await openBook(bookId);
-      if (tab !== 'manuscript') switchTab(tab);
-      requestAnimationFrame(() => {
-        if (pos.chapterId && book && book.chapterOrder.includes(pos.chapterId)) currentChapterId = pos.chapterId;
-        $('#paper-scroll').scrollTop = pos.scroll;
-        highlightNav();
+
+    // First read everything that changed; the page is left alone until it is
+    // all in. (Deciding chapter by chapter between reads let a keystroke land
+    // on a page that no longer matched what NEO held, and reopening the book
+    // for a new book.json dropped whatever was typed while it loaded.)
+    const theirs = metaSig(meta) !== savedMetaSig && Array.isArray(meta.chapterOrder);
+    const sigHere = metaSig(book);
+    const mine = sigHere !== savedMetaSig; // restructured here too, not saved yet
+    const incoming = {}; // chapters new to this device
+    let side = null;
+    if (theirs) {
+      for (const chId of meta.chapterOrder) {
+        if (chapterHTML[chId] !== undefined) continue;
+        incoming[chId] = await window.neo.readChapter(bookId, chId);
+        if (!book || book.id !== bookId) return;
+      }
+      side = {
+        stickies: await window.neo.readJSON(bookId, 'stickies', stickies),
+        darlings: await window.neo.readJSON(bookId, 'darlings', darlings)
+      };
+    }
+    // file times first, so only chapters that changed on disk are re-read
+    // (a whole novel crossing the bridge every half minute is a hiccup)
+    let stamps = null;
+    if (window.neo.chapterStamps) {
+      try { stamps = await window.neo.chapterStamps(bookId); } catch { stamps = null; }
+    }
+    const fresh = [];
+    for (const chId of [...book.chapterOrder]) {
+      if (writing[chId]) continue; // a save of ours is on its way: the file is ours, not news
+      const st = stamps ? stamps[chId] : undefined;
+      if (st !== undefined && st === diskStamps[chId]) continue;
+      const before = savedHTML[chId];
+      const disk = await window.neo.readChapter(bookId, chId);
+      if (!book || book.id !== bookId) return;
+      fresh.push({ chId, st, before, disk });
+    }
+    if (!book || book.id !== bookId) return;
+
+    // Then decide it all in one go: nothing waits from here to the page.
+    let restructured = false;
+    if (theirs && metaSig(book) === sigHere) {
+      // The other device added, renamed or moved chapters. Whichever
+      // book.json stands, no chapter holding words is dropped: theirs keeps
+      // the chapters with unsaved words here, and ours (when this device
+      // restructured too and hasn't saved yet) takes in the chapters they wrote.
+      const order = [...(mine ? book.chapterOrder : meta.chapterOrder)];
+      const other = mine ? meta.chapterOrder : book.chapterOrder;
+      other.forEach((chId, i) => {
+        if (order.includes(chId)) return;
+        if (mine ? !/[^\s]/.test(String(incoming[chId] || '').replace(/<[^>]*>/g, '')) : chapterHTML[chId] === savedHTML[chId]) return;
+        const prev = other.slice(0, i).reverse().find((c) => order.includes(c));
+        order.splice(prev ? order.indexOf(prev) + 1 : 0, 0, chId);
       });
-      toast(t('Updated from your other device'));
-      return;
+      if (!mine || order.length !== book.chapterOrder.length) {
+        for (const chId of order) {
+          if (!(chId in incoming)) continue;
+          chapterHTML[chId] = incoming[chId];
+          savedHTML[chId] = incoming[chId];
+        }
+        if (mine) {
+          book.chapterOrder = order;
+        } else {
+          book = { ...meta, chapterOrder: order, lastPosition: book.lastPosition };
+          savedMetaSig = metaSig(meta);
+          stickies = side.stickies;
+          darlings = side.darlings;
+        }
+        if (metaSig(book) !== savedMetaSig) scheduleMetaSave();
+        if (!book.chapterOrder.includes(currentChapterId)) currentChapterId = null;
+        undoStack = []; // snapshots of the old structure must not replay over the new one
+        restructured = true;
+      }
     }
     let adopted = 0;
     let conflicts = 0;
-    for (const chId of [...book.chapterOrder]) {
-      const disk = await window.neo.readChapter(bookId, chId);
-      if (!book || book.id !== bookId) return;
-      if (typeof disk !== 'string' || disk === savedHTML[chId]) continue;
+    const replaced = []; // page text a disk copy would otherwise have taken away
+    for (const { chId, st, before, disk } of fresh) {
+      if (!book.chapterOrder.includes(chId)) continue;
+      // A save of ours crossed this read, so what came back can be older
+      // than the page. Taking it put the old text back on the page, and the
+      // next save made that stick. Look again next time.
+      if (writing[chId] || savedHTML[chId] !== before) continue;
+      if (typeof disk !== 'string') continue;
       if (disk === '' && savedHTML[chId]) continue; // unreadable or still downloading: not a change
+      if (stamps) diskStamps[chId] = st; // seen; a file not read stays on the list
+      if (disk === savedHTML[chId]) continue;
       if (chapterHTML[chId] === savedHTML[chId]) {
+        // A copy with nothing new in it, only fewer words, is an older copy
+        // coming back (or text cut on the other device): the page's version
+        // goes to Darlings instead of nowhere.
+        if (onlyDrops(chapterHTML[chId], disk)) {
+          const holder = document.createElement('div');
+          holder.innerHTML = chapterHTML[chId];
+          replaced.push({
+            id: 'd-' + Date.now().toString(36) + replaced.length,
+            html: chapterHTML[chId],
+            text: [...holder.children].map((p) => p.textContent).join('\n\n').slice(0, 2000),
+            chapterId: chId,
+            chapterLabel: t('Chapter {n}', { n: book.chapterOrder.indexOf(chId) + 1 }),
+            date: new Date().toISOString()
+          });
+        }
         chapterHTML[chId] = disk;
         savedHTML[chId] = disk;
         wordCache[chId] = null;
@@ -3608,15 +5190,31 @@ async function refreshFromDisk() {
         conflicts++;
       }
     }
-    if (adopted || conflicts) {
+    if (restructured || adopted || conflicts) {
       const caret = captureCaret();
       const keepScroll = $('#paper-scroll').scrollTop;
       renderChapters();
       $('#paper-scroll').scrollTop = keepScroll;
       if (caret) restoreCaret(caret);
+      if (restructured) {
+        const show = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+        show($('#tp-title'), isUntitled(book.title) ? '' : book.title);
+        show($('#tp-subtitle'), book.subtitle || '');
+        show($('#tp-author'), book.author || t('Anonymous'));
+        $$('.tab[data-tab="notes"]')[0].textContent = tabName('notes');
+        $$('.tab[data-tab="outline"]')[0].textContent = tabName('outline');
+        renderStickies();
+        if (currentTab === 'outline') renderOutline();
+      }
       updateCounters();
       scheduleNavRefresh();
+      if (replaced.length) {
+        darlings.unshift(...replaced);
+        window.neo.writeJSON(bookId, 'darlings', darlings);
+      }
+      if (currentTab === 'darlings' && (restructured || replaced.length)) renderDarlings();
       if (conflicts) toast(t('This chapter also changed on another device. That version is saved as the chapter after it.'), 8000);
+      else if (replaced.length) toast(t('Updated from your other device — the text it replaced is in Darlings'), 8000);
       else toast(t('Updated from your other device'));
     }
   } catch (err) {
@@ -3744,6 +5342,7 @@ function snapshotStructure(label, opts) {
     rejoin: !!(opts && opts.rejoin),
     caret: captureCaret(),
     chapterOrder: [...book.chapterOrder],
+    chapterKinds: { ...(book.chapterKinds || {}) },
     chapterHTML: { ...chapterHTML },
     chapterTitles: { ...(book.chapterTitles || {}) },
     chapterNotes: { ...(book.chapterNotes || {}) },
@@ -3758,6 +5357,7 @@ async function structuralUndo() {
   const snap = undoStack.pop();
   if (!snap || !book) return;
   book.chapterOrder = snap.chapterOrder;
+  book.chapterKinds = snap.chapterKinds;
   chapterHTML = snap.chapterHTML;
   book.chapterTitles = snap.chapterTitles;
   book.chapterNotes = snap.chapterNotes;
@@ -3850,7 +5450,6 @@ let searchState = { matches: [], idx: -1, query: '' };
 
 function openSearch() {
   if ($('#editor-view').hidden || !book) { toast(t('Open a book first')); return; }
-  switchTab('manuscript');
   const sel = window.getSelection();
   const preset = sel && !sel.isCollapsed ? sel.toString().slice(0, 80).trim() : '';
   $('#searchbar').hidden = false;
@@ -3881,19 +5480,28 @@ function paintHighlights() {
   CSS.highlights.set('neo-search-current', cur);
 }
 
-// Scan the WHOLE book, first chapter to last, every time.
-// Matches are highlighted, not selected.
+// Find searches the tab you're in: the whole manuscript, first chapter to
+// last, or the Notes page, the outline's lines, the Darlings. Replace stays
+// with the manuscript, where ⌘Z can take a Replace All back.
+function searchRoots() {
+  if (currentTab === 'manuscript') return book.chapterOrder.map((chId) => document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`));
+  if (currentTab === 'outline') return $$('#outline-list .ol-text');
+  if (currentTab === 'darlings') return $$('#darlings-list .darling > :first-child');
+  return [$('#aux-editor')];
+}
+
+// Scan the whole tab every time. Matches are highlighted, not selected.
 function runSearch() {
   const q = $('#search-input').value;
-  searchState = { matches: [], idx: -1, query: q };
+  searchState = { matches: [], idx: -1, query: q, tab: currentTab };
+  $('#searchbar').classList.toggle('find-only', currentTab !== 'manuscript');
   if (!q) {
     $('#search-count').textContent = '';
     paintHighlights();
     return;
   }
   const ql = q.toLowerCase();
-  for (const chId of book.chapterOrder) {
-    const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+  for (const body of searchRoots()) {
     if (!body) continue;
     const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
     let node;
@@ -3928,10 +5536,11 @@ function gotoMatch(i) {
 }
 
 function freshSearchIfStale() {
-  if (searchState.query !== $('#search-input').value) runSearch();
+  if (searchState.query !== $('#search-input').value || searchState.tab !== currentTab) runSearch();
 }
 
 function replaceCurrent() {
+  if (currentTab !== 'manuscript') return;
   freshSearchIfStale();
   if (!searchState.matches.length) { toast(t('No matches')); return; }
   if (searchState.idx < 0) searchState.idx = 0; // start from the very first match
@@ -3955,7 +5564,7 @@ function replaceCurrent() {
 // Every chapter, front to back
 function replaceAllMatches() {
   const q = $('#search-input').value;
-  if (!q) return;
+  if (!q || currentTab !== 'manuscript') return;
   snapshotStructure('replace all');
   const rep = $('#replace-input').value;
   const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
@@ -3997,7 +5606,7 @@ $('#search-input').addEventListener('keydown', (e) => {
       r.collapse(false);
       sel.removeAllRanges();
       sel.addRange(r);
-      const body = m.range.startContainer.parentElement.closest('.chapter-body');
+      const body = m.range.startContainer.parentElement.closest('[contenteditable="true"]');
       if (body) body.focus();
     }
   }
@@ -4050,15 +5659,16 @@ async function addImportedBooks(results, shelf) {
       }).join('') || '<p><br></p>';
       await window.neo.writeChapter(meta.id, chId, html);
       if (ch.title) meta.chapterTitles[chId] = ch.title;
+      if (ch.role) meta[ch.role] = chId;
       meta.chapterOrder.push(chId);
       for (const p of ch.paras) words += countWords(p.text || '');
     }
     meta.wordCount = words;
-    await window.neo.writeBookMeta(meta.id, meta);
-    shelf.bookIds.push(meta.id);
+    await writeBookMeta(meta.id, meta);
+    await placeTitle(shelf, meta.id);
     ok++;
   }
-  await window.neo.writeLibrary(library);
+  await writeLibrary(library);
   if (!$('#bookshelf-view').hidden) renderShelves();
   if (ok) toast(t('{n} books imported onto “{shelf}” — chapters and scene breaks detected', { n: ok, shelf: shelf.name }), 6000);
 }
@@ -4178,13 +5788,13 @@ function toggleSpellcheck() {
 const SPELL_LANGUAGE_NAMES = {
   'en-US': t('US English'), 'en-GB': t('UK English'), 'en-CA': t('Canadian English'),
   'en-AU': t('Australian English'), fr: t('French'), es: t('Spanish'), de: t('German'),
-  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': 'Português (Brasil)'
+  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': 'Português (Brasil)', ro: t('Romanian'), ru: t('Russian')
 };
 async function changeSpellLanguage(code) {
   const ok = await window.neo.setSpellLanguage(code);
   if (!ok) { toast(t('That dictionary would not load')); return; }
   library.spellLanguage = code;
-  await window.neo.writeLibrary(library);
+  await writeLibrary(library);
   spellCache.clear();
   if (spellOn) {
     spellScanned = new Set();
@@ -4229,8 +5839,11 @@ document.addEventListener('contextmenu', async (e) => {
     learn: async () => {
       library.customWords = library.customWords || [];
       if (!library.customWords.includes(word)) library.customWords.push(word);
-      await window.neo.writeLibrary(library);
+      await writeLibrary(library);
       await window.neo.spellLearn(word);
+      // Learning also accepts equivalent Unicode spellings. Recheck cached
+      // failures so those variants lose their underlines in every editor.
+      spellCache.clear();
       spellCache.set(word, true);
       for (const k of [...spellScanned]) spellScanEl(spellElFor(k), k);
     }
@@ -4276,15 +5889,32 @@ function showSpellMenu(x, y, word, suggestions, actions) {
 let typewriterEnabled = false;
 // The page needs empty room beneath its last line, or the caret can't be held
 // at the centre once the end of the draft scrolls into view (body.typewriter
-// deepens #paper's bottom margin; see styles.css).
+// deepens #paper's bottom margin; see styles.css). Only as much as the last
+// page's own blank paper doesn't already give: a page that is mostly blank
+// needs none, and a fixed 60vh left an empty scroll under it from line one.
 function applyTypewriter() {
   document.body.classList.toggle('typewriter', typewriterEnabled);
   if (window.neo.typewriterState) window.neo.typewriterState(typewriterEnabled); // the Format menu's tick
+  typewriterRoom();
 }
+function typewriterRoom() {
+  const paper = $('#paper');
+  const bodies = $$('#chapters .chapter-body');
+  const last = bodies[bodies.length - 1];
+  if (!typewriterEnabled || !last || paper.hidden) return;
+  const line = parseFloat(getComputedStyle(last).lineHeight) || 30;
+  // the last line must be able to rise to the writing height (45% of the
+  // window, as in the selectionchange handler below)
+  const below = paper.getBoundingClientRect().bottom - last.getBoundingClientRect().bottom;
+  const room = $('#paper-scroll').clientHeight - window.innerHeight * 0.45 - below + line;
+  paper.style.setProperty('--typewriter-room', Math.max(120, Math.ceil(room)) + 'px');
+}
+new ResizeObserver(() => typewriterRoom()).observe($('#chapters'));
+window.addEventListener('resize', typewriterRoom);
 function toggleTypewriter() {
   typewriterEnabled = !typewriterEnabled;
   library.typewriter = typewriterEnabled;
-  window.neo.writeLibrary(library);
+  writeLibrary(library);
   applyTypewriter();
   toast(typewriterEnabled ? t('Typewriter scrolling ON — your line stays centered') : t('Typewriter scrolling off'));
 }
@@ -4318,7 +5948,7 @@ document.addEventListener('selectionchange', () => {
       // a band of about three lines around the writing height
       if (Math.abs(diff) <= lineHeight * 1.5) return;
       const scroller = $('#paper-scroll');
-      scroller.scrollTo({ top: scroller.scrollTop + diff, behavior: 'smooth' });
+      scroller.scrollTo({ top: scroller.scrollTop + diff, behavior: scrollBehavior() });
     } catch { /* selection mid-mutation; skip this frame */ }
   });
 });
@@ -4336,7 +5966,7 @@ let focusLevel = 'off';
 // the View menu's ticks (focus level, page, brighter interface) follow the page
 function reportViewState() {
   if (!window.neo.viewState || !library) return;
-  window.neo.viewState({ focus: focusLevel, pageTheme: library.pageTheme || 'night', uiBright: !!library.uiBright });
+  window.neo.viewState({ focus: focusLevel, pageTheme: library.pageTheme || 'night', uiBright: document.body.classList.contains('bright') });
 }
 
 function applyFocus() {
@@ -4350,7 +5980,7 @@ function setFocus(level) {
   if (!FOCUS_LEVELS.includes(level)) return;
   focusLevel = level;
   library.focus = level;
-  window.neo.writeLibrary(library);
+  writeLibrary(library);
   applyFocus();
   toast(t(FOCUS_LABELS[level] || ''));
 }
@@ -4488,14 +6118,14 @@ function statsChartSvg() {
   const goalLine = goal
     ? `<line x1="${PAD}" x2="${W - PAD}" y1="${(H - PAD - (goal / maxC) * (H - PAD * 2 - 20)).toFixed(1)}" y2="${(H - PAD - (goal / maxC) * (H - PAD * 2 - 20)).toFixed(1)}" stroke="#c9a86a" stroke-dasharray="5,4" stroke-width="1" opacity="0.7"/>`
     : '';
-  return `<svg id="stats-chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  return `<svg id="stats-chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${escHtml(t('Words written over the last 30 days')).replace(/"/g, '&quot;')}">
     ${bars}
     <path d="${line}" fill="none" stroke="#c9a86a" stroke-width="2"/>
     ${goalLine}
   </svg>
-  <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;padding:2px 4px">
+  <div class="stats-legend">
     <span>${t('30 days ago')}</span>
-    <span style="color:#3d8a6a">▮ ${t('daily words')}</span>
+    <span class="sl-daily">▮ ${t('daily words')}</span>
     <span style="color:var(--accent)">— ${t('total')}${goal ? ' · - - ' + t('goal') : ''}</span>
     <span>${t('today')}</span>
   </div>`;
@@ -4596,7 +6226,7 @@ function openCoverArt() {
       quality: bd.querySelector('#ca-quality').value,
       models
     };
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     done();
     if (!(await window.neo.hasSecret(id))) toast(t('Saved. Add a {name} key to start painting.', { name: p.name }), 5000);
   };
@@ -4604,7 +6234,8 @@ function openCoverArt() {
   key.focus();
 }
 
-// An hour of the day as the writer's language says it: 1 am / 13 h / 13 Uhr
+// An hour of the day as the writer's language says it: 1 am / 13 h / 13 Uhr,
+// or 13:00 where the language's hour is a bare number
 function hourLabel(h) {
   if (h === 0) return t('midnight');
   const loc = NeoI18n.getLocale();
@@ -4612,7 +6243,9 @@ function hourLabel(h) {
     if (h === 12) return t('noon');
     return h < 12 ? t('{h} am', { h: String(h) }) : t('{h} pm', { h: String(h - 12) });
   }
-  return new Intl.DateTimeFormat(loc, { hour: 'numeric' }).format(new Date(2000, 0, 1, h));
+  const at = new Date(2000, 0, 1, h);
+  const hour = new Intl.DateTimeFormat(loc, { hour: 'numeric' }).format(at);
+  return /^\d+$/.test(hour) ? new Intl.DateTimeFormat(loc, { hour: '2-digit', minute: '2-digit' }).format(at) : hour;
 }
 
 function openStats() {
@@ -4660,7 +6293,7 @@ function openStats() {
       book.wordGoal = parseInt(bd.querySelector('#st-book').value, 10) || 0;
       scheduleMetaSave();
     }
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     bd.remove();
     if (hasBook) updateCounters();
   };
@@ -4671,7 +6304,6 @@ function openStats() {
   bd.tabIndex = -1;
   bd.focus();
   bd.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
-  bd.addEventListener('mousedown', (e) => { if (e.target === bd) close(); });
   if (hasBook) {
     bd.querySelector('#st-sprint-btn').onclick = () => {
       if (sprint && !sprint.done) {
@@ -4706,15 +6338,17 @@ const BODY_FONTS = {
   'Hoefler Text': '"Hoefler Text", Georgia, serif',
   'Iowan Old Style': '"Iowan Old Style", Georgia, serif',
   'Cambria': 'Cambria, Georgia, serif',
-  'Constantia': 'Constantia, Georgia, serif'
+  'Constantia': 'Constantia, Georgia, serif',
+  // a sans-serif for those who write in one (bundled, so it's the same everywhere)
+  'Jost': '"Jost", "Avenir Next", "Helvetica Neue", Arial, sans-serif'
 };
 
 // Hoefler Text and Iowan Old Style ship only with macOS; elsewhere they
 // would fall back to Georgia, so offer the fonts Windows actually has.
 // Keep in step with bodyFonts in main.js.
 const BODY_FONT_CHOICES = IS_MAC
-  ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style']
-  : ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia'];
+  ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost']
+  : ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost'];
 
 function applyFonts() {
   const f = library.fonts || {};
@@ -4726,11 +6360,20 @@ function applyFonts() {
   }
   document.body.classList.toggle('no-dropcap', f.dropcap === 'none');
   document.body.classList.toggle('night', library.pageTheme === 'night');
-  document.body.classList.toggle('bright', !!library.uiBright);
+  // Light: the paper page in a light room, the whole app with it
+  document.body.classList.toggle('light', library.pageTheme === 'light');
+  // the system's "Increase contrast" turns it on too, until the writer
+  // chooses in the View menu
+  document.body.classList.toggle('bright', library.uiBright === undefined ? SYSTEM_CONTRAST.matches : !!library.uiBright);
   reportViewState();
+  // View → Interface Size: everything but the page
+  const uiZoom = [1, 1.25, 1.5, 2, 2.5, 3].includes(library.uiZoom) ? library.uiZoom : 1;
+  document.documentElement.style.setProperty('--ui-zoom', uiZoom);
+  document.documentElement.classList.toggle('ui-zoomed', uiZoom > 1);
+  if (window.neo.uiZoomState) window.neo.uiZoomState(uiZoom);
   const size = Math.min(22, Math.max(14, library.editorFontSize || 17));
   document.documentElement.style.setProperty('--editor-size', size + 'px');
-  const zoom = Math.min(1.6, Math.max(0.75, library.pageZoom || 1));
+  const zoom = Math.min(3, Math.max(0.75, library.pageZoom || 1));
   document.documentElement.style.setProperty('--page-zoom', zoom);
   updateZoomDisplay();
 }
@@ -4809,19 +6452,56 @@ function updateZoomDisplay() {
   const el = $('#zoom-level');
   if (el) el.textContent = Math.round((library.pageZoom || 1) * 100) + '%';
 }
-function setPageZoom(next) {
-  next = Math.min(1.6, Math.max(0.75, next));
+// Zooming or resizing the text reflows the whole book, and the same scroll
+// offset lands somewhere else. Pin a spot in the text first: the caret if
+// it's on screen, otherwise the point being pinched, otherwise the middle
+// of the page. Then scroll it back to where it was.
+function keepReadingPlace(change, at) {
+  const sc = $('#paper-scroll');
+  if (!sc || $('#editor-view').hidden) { change(); return; }
+  const box = sc.getBoundingClientRect();
+  const topOf = (r) => {
+    const rect = r.getBoundingClientRect();
+    if (rect.height) return rect.top;
+    const el = r.startContainer.nodeType === Node.ELEMENT_NODE ? r.startContainer : r.startContainer.parentElement;
+    return el ? el.getBoundingClientRect().top : null; // an empty line has no text to measure
+  };
+  let anchor = null;
+  const sel = window.getSelection();
+  if (!at && sel.rangeCount && sc.contains(sel.anchorNode)) {
+    const caret = sel.getRangeAt(0).cloneRange();
+    caret.collapse(true);
+    const y = topOf(caret);
+    if (y !== null && y >= box.top && y <= box.bottom) anchor = caret;
+  }
+  if (!anchor) {
+    const x = Math.min(box.right - 1, Math.max(box.left + 1, at ? at.x : box.left + box.width / 2));
+    const y = Math.min(box.bottom - 1, Math.max(box.top + 1, at ? at.y : box.top + box.height / 2));
+    const r = document.caretRangeFromPoint(x, y);
+    if (r && sc.contains(r.startContainer)) anchor = r;
+  }
+  const before = anchor && topOf(anchor);
+  change();
+  if (before === null || before === undefined) return;
+  const after = topOf(anchor); // reads the new layout
+  if (after !== null) sc.scrollTop += after - before;
+}
+
+function setPageZoom(next, at) {
+  // up to 300%: on a large monitor 160% still read small. The page itself
+  // never grows past the window (max-width in styles.css), only the type does.
+  next = Math.min(3, Math.max(0.75, next));
   if (next === (library.pageZoom || 1)) return;
   library.pageZoom = next;
-  document.documentElement.style.setProperty('--page-zoom', next);
+  keepReadingPlace(() => document.documentElement.style.setProperty('--page-zoom', next), at);
   updateZoomDisplay();
   clearTimeout(zoomSaveTimer);
-  zoomSaveTimer = setTimeout(() => { window.neo.writeLibrary(library); }, 600);
+  zoomSaveTimer = setTimeout(() => { writeLibrary(library); }, 600);
 }
 $('#editor-view').addEventListener('wheel', (e) => {
   if (!e.ctrlKey) return;
   e.preventDefault();
-  setPageZoom((library.pageZoom || 1) * Math.exp(-e.deltaY * 0.005));
+  setPageZoom((library.pageZoom || 1) * Math.exp(-e.deltaY * 0.005), { x: e.clientX, y: e.clientY });
 }, { passive: false });
 
 // zoom control in the bottom bar: buttons, click-to-reset, and scroll
@@ -4903,8 +6583,11 @@ function shortcutSections() {
       [[K('⌘⇧F', 'Ctrl+Shift+F'), K('⌘Enter', 'Ctrl+Enter')], tk('Toggle full screen')],
       [K('⌘⇧T', 'Ctrl+Shift+T'), tk('Toggle typewriter scrolling')],
       [K('⌘⇧O', 'Ctrl+Shift+O'), tk('Cycle focus mode'), tk('Off → paragraph → sentence → off.')],
+      [K('⌥⌘↓', 'Ctrl+Alt+↓'), tk('Go to the next chapter')],
+      [K('⌥⌘↑', 'Ctrl+Alt+↑'), tk('Go to the previous chapter')],
       [K('⌘M', 'Ctrl+M'), tk('Minimize window')],
       [K('⌘W', 'Ctrl+W'), tk('Close window')],
+      [['F6', K('⌃Tab', 'Ctrl+Tab')], tk('Move between the page, the chapters, the notes and the bottom bar'), tk('Add Shift to go back. Esc returns to the page. On the shelf: the books, then the header.')],
       ...(IS_MAC ? [
         ['⌘H', tk('Hide NEO')],
         ['⌘⌥H', tk('Hide other apps')]
@@ -4930,7 +6613,7 @@ function showHelp() {
         <h2 id="shortcuts-title">${t('Keyboard shortcuts')}</h2>
       </header>
       <div class="shortcuts-content" tabindex="0" role="region" aria-label="${t('Shortcut reference')}"></div>
-      <footer class="shortcuts-footer">
+      <footer class="shortcuts-footer" role="none">
         <span>${t(K(tk('⌘ Command · ⇧ Shift · ⌥ Option · ⌃ Control'), tk('Ctrl Control · Shift · Alt')))}</span>
         <button class="m-ok btn-gold">${t('Done')}</button>
       </footer>
@@ -4958,7 +6641,6 @@ function showHelp() {
     }
   };
   bd.querySelector('.m-ok').onclick = close;
-  bd.addEventListener('mousedown', (e) => { if (e.target === bd) close(); });
   const handleKeyDown = (e) => {
     e.stopPropagation(); // The editor must not handle keys while reading help.
     if (e.key === 'Escape') { e.preventDefault(); close(); }
@@ -4978,8 +6660,11 @@ function showHelp() {
 /*  EXPORT + EMAIL                                                     */
 /* ================================================================== */
 
+// letters of every script stay (a Russian title keeps its name), only
+// punctuation goes
 function safeName(s) {
-  return (s || t('Untitled')).replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-');
+  const clean = (x) => x.replace(/[^\p{L}\p{M}\p{N}_\s-]/gu, '').trim().replace(/\s+/g, '-');
+  return clean(s || '') || clean(t('Untitled'));
 }
 
 // Every paragraph is rebuilt from its text runs, so exports carry only
@@ -5000,7 +6685,7 @@ function parasFromHtml(html) {
     const sceneBreak = p.classList.contains('scene-break');
     const poetry = p.classList.contains('poetry');
     const align = (p.style && p.style.textAlign) || '';
-    const runs = paraRuns(p.innerHTML).filter((r) => r.text);
+    const runs = paraRuns(p.innerHTML, true).filter((r) => r.text);
     const inner = runs.map((r) => {
       let t = escHtml(r.text);
       if (r.i) t = '<i>' + t + '</i>';
@@ -5018,20 +6703,60 @@ function parasFromHtml(html) {
   }).filter((p) => p.sceneBreak || p.text);
 }
 
+// The book's entries as the builders lay them out. Chapters, a prologue and
+// an epilogue are prose under their headings; a part is a page of its own
+// (its first line its title); the pages a book carries are set the way books
+// set them, and one left blank stays out. `toc` is the table of contents.
+// The Contents entry, when the book has one, is where a printed contents
+// page goes: what comes before it is the front of the book. Without one,
+// the front is the copyright, dedication and epigraph that open the book.
+const FRONT_PAGES = ['copyright', 'dedication', 'epigraph'];
 function exportChapters() {
-  // [{num, heading, paras: [{text, sceneBreak, html}]}]
-  return book.chapterOrder.map((chId, i) => {
+  const solo = soloStory();
+  const sections = [];
+  const toc = [];
+  const push = (sec) => { sec.num = sections.length + 1; sections.push(sec); return sec; };
+  let parts = 0;
+  let inPart = false;
+  let contentsAt = -1;
+  for (const chId of book.chapterOrder) {
+    const kind = chapterKind(chId);
+    if (kind === 'part') { parts += 1; inPart = true; } else if (BACK_KINDS.includes(kind)) inPart = false;
+    if (kind === 'contents') { if (contentsAt < 0) contentsAt = sections.length; continue; }
     const el = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
     const paras = parasFromHtml(el ? el.innerHTML : (chapterHTML[chId] || ''));
+    if (FRONT_PAGES.includes(kind)) {
+      if (paras.length) push({ kind, heading: '', label: kindName(kind), level: 0, paras });
+      continue;
+    }
+    if (kind === 'acknowledgments' || kind === 'about') {
+      if (!paras.length) continue;
+      const sec = push({ kind, heading: kindName(kind), level: 0, paras });
+      toc.push({ label: sec.heading, num: sec.num, level: 0, type: 'page' });
+      continue;
+    }
+    if (kind === 'part') {
+      // the page's first line is the part's title; what follows, a quote or a verse
+      const titled = !!(paras[0] && !paras[0].sceneBreak && !isAttribution(paras[0]));
+      const partTitle = titled ? paras[0].text : '';
+      const sec = push({ kind: 'part', heading: partLabel(parts), partTitle, level: 0, paras: titled ? paras.slice(1) : paras });
+      toc.push({ label: partTitle ? sec.heading + ': ' + partTitle : sec.heading, num: sec.num, level: 0, type: 'part' });
+      continue;
+    }
+    // the story: chapterless stories export as continuous text
     const chTitle = (book.chapterTitles || {})[chId];
-    // chapterless stories export as continuous text
-    const heading = book.chapterOrder.length === 1
+    const heading = chId === solo
       ? ''
       : library.exportCustomChapterTitles && chTitle
         ? chTitle
-        : t('Chapter {n}', { n: i + 1 }) + (chTitle ? ' — ' + chTitle : '');
-    return { num: i + 1, heading, paras };
-  });
+        : chapterName(chId) + (chTitle ? ' — ' + chTitle : '');
+    const level = inPart ? 1 : 0;
+    const sec = push({ kind: 'chapter', heading, paras, role: chapterRole(chId) || '', level });
+    toc.push({ label: heading || book.title, num: sec.num, level, type: 'chapter' });
+  }
+  if (contentsAt >= 0) sections.forEach((sec, i) => { sec.front = i < contentsAt; });
+  else for (const sec of sections) { if (!FRONT_PAGES.includes(sec.kind)) break; sec.front = true; }
+  return { sections, toc, contents: contentsAt >= 0 };
 }
 
 // The open book, packaged for the builders. Every builder takes an optional
@@ -5043,18 +6768,27 @@ function bookExportData() {
     book.uuid = crypto.randomUUID();
     saveMeta();
   }
+  const { sections, toc, contents } = exportChapters();
   return {
     id: book.id,
     uuid: book.uuid,
     title: book.title,
     subtitle: book.subtitle,
     author: book.author || t('Anonymous'), // the screen says so; the files should too
-    language: library.spellLanguage || 'en',
+    language: writingLanguage(),
     coverSeed: book.coverSeed,
     coverImage: book.coverImage || null,
-    sections: exportChapters()
+    sections,
+    toc,
+    // a printed contents page only where the writer put one; it lists the
+    // chapters too (a book of books lists its titles instead)
+    contents,
+    contentsChapters: true
   };
 }
+
+// a heading as plain text: a part's name with its title
+const plainHeading = (ch) => (ch.partTitle ? `${ch.heading}: ${ch.partTitle}` : ch.heading);
 
 function buildTxt(data) {
   const d = data || bookExportData();
@@ -5062,7 +6796,7 @@ function buildTxt(data) {
   if (d.subtitle) out += `${d.subtitle}\n`;
   out += t('by {author}', { author: d.author }) + '\n\n\n';
   for (const ch of d.sections) {
-    if (ch.heading) out += `${ch.heading.toUpperCase()}\n\n`;
+    if (ch.heading) out += `${plainHeading(ch).toUpperCase()}\n\n`;
     for (const p of ch.paras) out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '    ' : '') + p.text + '\n\n';
     out += '\n';
   }
@@ -5087,7 +6821,7 @@ function buildMd(data) {
   if (d.subtitle) out += `*${mdMeta(d.subtitle)}*\n\n`;
   out += `**${t('by {author}', { author: mdMeta(d.author) })}**\n\n`;
   for (const ch of d.sections) {
-    if (ch.heading) out += `\n## ${mdMeta(ch.heading)}\n\n`;
+    if (ch.heading) out += `\n## ${mdMeta(plainHeading(ch))}\n\n`;
     for (const p of ch.paras) {
       out += p.sceneBreak ? '\n***\n\n' : (p.poetry ? '> ' : '') + p.runs.map(mdRun).join('') + '\n\n';
     }
@@ -5095,15 +6829,60 @@ function buildMd(data) {
   return out;
 }
 
+// The Web Page and PDF read in the page's own typeface. A face NEO ships
+// (the @font-face rules in styles.css, the body fonts on Linux) travels
+// inside the file, so the PDF matches the page on any machine; a font the
+// computer has goes by name, with the same fallbacks as the page.
+const exportBodyFont = () => (getComputedStyle(document.documentElement).getPropertyValue('--body-font').trim() || 'Georgia, serif').replace(/[<>{};]/g, '');
+async function exportFontFaces(d) {
+  const family = exportBodyFont().split(',')[0].trim().replace(/^["']|["']$/g, '');
+  const text = d.sections.map((ch) => ch.paras.map((p) => p.html).join('')).join('');
+  // (the title is always bold; a dedication, an epigraph, a part's lines
+  // and a title's subtitle are set in italic)
+  const italic = !!d.subtitle || /<i[\s>]/.test(text)
+    || d.sections.some((ch) => ['dedication', 'epigraph', 'part'].includes(ch.kind) || ch.subtitle);
+  const boldItalic = italic && /<b[\s>]/.test(text);
+  let css = '';
+  for (const sheet of document.styleSheets) {
+    let rules = [];
+    try { rules = [...sheet.cssRules]; } catch { continue; }
+    for (const r of rules) {
+      if (!(r instanceof CSSFontFaceRule)) continue;
+      if (r.style.getPropertyValue('font-family').replace(/["']/g, '').trim() !== family) continue;
+      const style = r.style.getPropertyValue('font-style') || 'normal';
+      const weight = r.style.getPropertyValue('font-weight') || '400';
+      if (style === 'italic' && !(parseInt(weight, 10) >= 600 ? boldItalic : italic)) continue;
+      const src = r.style.getPropertyValue('src').match(/url\(["']?([^"')]+)["']?\)\s*(format\([^)]*\))?/);
+      if (!src) continue;
+      try {
+        const bytes = new Uint8Array(await (await fetch(new URL(src[1], sheet.href || location.href))).arrayBuffer());
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        const ext = src[1].split('.').pop().toLowerCase();
+        css += `@font-face { font-family: '${family}'; src: url(data:font/${ext};base64,${btoa(bin)}) ${src[2] || ''}; font-weight: ${weight}; font-style: ${style}; }\n`;
+      } catch { /* the name still stands, with its fallbacks */ }
+    }
+  }
+  return css;
+}
+
+// The pages of a book that aren't chapters, set the way books set them.
+// A line that opens with a dash says who said the lines above it.
+const isAttribution = (p) => /^(?:[—–]|--?\s)/.test(p.text || '');
+// a section's heading level follows the contents: a part, the titles in
+// it, their chapters (a single book's chapters are all level 0)
+const headTag = (ch) => 'h' + Math.min(6, 2 + (ch.level || 0));
+
 function buildHtml(data, opts = {}) {
   const d = data || bookExportData();
-  const total = d.sections.reduce((s, ch) => s + ch.paras.reduce((n, p) => n + countWords(p.text || ''), 0), 0);
+  const total = d.sections.filter((ch) => (ch.kind || 'chapter') === 'chapter')
+    .reduce((s, ch) => s + ch.paras.reduce((n, p) => n + countWords(p.text || ''), 0), 0);
   const stamp = new Date().toLocaleString(NeoI18n.getLocale());
-  const chaptersHtml = d.sections.map((ch) => {
-    // only the chapter's opening paragraph gets the enlarged initial —
-    // scene breaks resume ordinary body text
-    let first = true;
-    const paras = ch.paras.map((p) => {
+  // a chapter's text: only its opening paragraph gets the enlarged initial,
+  // scene breaks resume ordinary body text
+  const prose = (paras, initial) => {
+    let first = initial;
+    return paras.map((p) => {
       if (p.sceneBreak) return '<p class="brk">***</p>';
       if (p.poetry) return p.html;
       let html = p.html;
@@ -5118,16 +6897,69 @@ function buildHtml(data, opts = {}) {
       first = false;
       return html;
     }).join('\n');
-    return `
-    <section class="chapter">
-      ${ch.heading ? `<h2>${escHtml(ch.heading)}</h2>` : ''}
-      ${paras}
-    </section>`;
+  };
+  // a page's lines, each set on its own
+  const lines = (paras, attrs = true) => paras.map((p) => {
+    if (p.sceneBreak) return '<p class="brk">***</p>';
+    const cls = [attrs && isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : ''].filter(Boolean).join(' ');
+    return `<p${cls ? ` class="${cls}"` : ''}${p.align ? ` style="text-align:${p.align}"` : ''}>${p.html.replace(/^<p[^>]*>|<\/p>$/g, '')}</p>`;
   }).join('\n');
+  const sectionHtml = (ch) => {
+    const id = 's' + ch.num;
+    const h = headTag(ch);
+    const kind = ch.kind || 'chapter';
+    if (kind === 'copyright' || kind === 'dedication' || kind === 'epigraph') {
+      return `
+    <section class="page ${kind}" id="${id}"><div class="pg-in">${lines(ch.paras, kind !== 'copyright')}</div></section>`;
+    }
+    if (kind === 'part') {
+      // the separator is there for the PDF's bookmarks ("Part I: Title"),
+      // not for the eye
+      return `
+    <section class="page part" id="${id}">
+      <${h} class="hd"><span class="pl">${escHtml(ch.heading)}</span>${ch.partTitle ? `<span class="sep">: </span><span class="pt">${escHtml(ch.partTitle)}</span>` : ''}</${h}>
+      ${lines(ch.paras)}
+    </section>`;
+    }
+    if (kind === 'opener') {
+      return `
+    <section class="page opener" id="${id}">
+      <${h} class="hd">${escHtml(ch.heading)}</${h}>
+      ${ch.subtitle ? `<p class="sub">${escHtml(ch.subtitle)}</p>` : ''}
+      ${ch.byline ? `<p class="byline">${escHtml(ch.byline)}</p>` : ''}
+    </section>`;
+    }
+    const back = kind === 'acknowledgments' || kind === 'about';
+    return `
+    <section class="chapter${back ? ' backpage' : ''}" id="${id}">
+      ${ch.heading ? `<${h} class="hd">${escHtml(ch.heading)}</${h}>` : ''}
+      ${ch.byline ? `<p class="byline">${escHtml(ch.byline)}</p>` : ''}
+      ${prose(ch.paras, !back)}
+    </section>`;
+  };
+  // Contents: the parts, the titles and the pages at the back. The page
+  // numbers are filled in by the PDF printer (main.js), which prints the
+  // book once to learn where everything landed.
+  const contents = d.contents && d.toc && d.toc.length ? `
+    <nav class="contents">
+      <h2 class="hd">${escHtml(t('Contents'))}</h2>
+      <ol>${d.toc.filter((e) => d.contentsChapters || e.type !== 'chapter').map((e) => `
+        <li class="lv${e.level} t-${e.type}"><a href="#s${e.num}"><span class="toc-t">${escHtml(e.label)}</span><span class="toc-pg" data-for="s${e.num}"></span></a></li>`).join('')}
+      </ol>
+    </nav>` : '';
+  // the contents follow the pages at the front of the book
+  let body = '';
+  let placed = !contents;
+  for (const ch of d.sections) {
+    if (!placed && !ch.front) { body += contents; placed = true; }
+    body += sectionHtml(ch);
+  }
+  if (!placed) body += contents;
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>${escHtml(d.title)}</title>
 <style>
-  body { font-family: Georgia, serif; color: #1c1c1c; max-width: 620px; margin: 40px auto; line-height: 1.7; font-size: 13pt; }
+  ${opts.fonts || ''}
+  body { font-family: ${exportBodyFont()}; color: #1c1c1c; max-width: 620px; margin: 40px auto; line-height: 1.7; font-size: 13pt; }
   .coverpage { text-align: center; margin: 0 0 40px; page-break-after: always; }
   .coverpage img { display: block; margin: 0 auto; width: 100%; max-width: 620px; max-height: 95vh; object-fit: contain; }
   .titlepage { text-align: center; margin: 30vh 0 20vh; page-break-after: always; }
@@ -5135,23 +6967,63 @@ function buildHtml(data, opts = {}) {
   .titlepage .sub { font-style: italic; color: #555; }
   .titlepage .auth { margin-top: 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 11pt; }
   .chapter { page-break-before: always; }
-  .chapter h2 { text-align: center; letter-spacing: 4px; text-transform: uppercase; font-size: 12pt; font-weight: normal; color: #555; margin: 60px 0 40px; }
+  /* headings in small capitals rather than capitals, so the PDF's bookmarks
+     read "Chapter 3", not "CHAPTER 3" */
+  .chapter .hd, .contents .hd { text-align: center; letter-spacing: 4px; font-variant-caps: all-small-caps; font-variant-numeric: oldstyle-nums; font-size: 17pt; font-weight: normal; color: #555; margin: 54px 0 36px; }
   .chapter p { text-indent: 2em; margin: 0; }
-  .chapter h2 + p, .brk + p, .chapter p.first { text-indent: 0; }
+  .chapter .hd + p, .chapter .byline + p, .brk + p, .chapter p.first { text-indent: 0; }
   /* an in-flow raised initial: stays inside its word for copy, search,
      and screen readers, unlike a floated drop cap */
-  ${(library.fonts || {}).dropcap === 'none' ? '' : '.chapter h2 + p:not(.poetry)::first-letter, .chapter p.first::first-letter { font-size: 1.8em; line-height: 1; }'}
+  ${(library.fonts || {}).dropcap === 'none' ? '' : '.chapter p.first::first-letter { font-size: 1.8em; line-height: 1; }'}
   .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
-  .chapter p:not(.poetry) + p.poetry, .chapter h2 + p.poetry { margin-top: 0.9em; }
+  .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
+  .chapter p.byline { text-align: center; margin: -24px 0 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 10pt; color: #555; }
+  /* the pages that aren't chapters */
+  .page { page-break-before: always; text-align: center; }
+  .page p { margin: 0 0 0.5em; }
+  .page p.poetry { margin: 0 0 0.2em; }
+  .page p.attr { font-style: normal; font-size: 10pt; letter-spacing: 1px; margin-top: 1.2em; }
+  .page .brk { margin: 1.2em 0; }
+  .copyright { min-height: 98vh; display: flex; flex-direction: column; justify-content: flex-end; text-align: left; font-size: 9pt; line-height: 1.6; color: #333; }
+  .copyright p { margin: 0 0 0.9em; }
+  .dedication { padding-top: 26vh; font-style: italic; }
+  .epigraph { padding-top: 24vh; margin: 0 3em; font-style: italic; }
+  .part { padding-top: 28vh; }
+  .part .hd { font-weight: normal; margin: 0 0 2.4em; }
+  .part .pl { display: block; font-size: 15.5pt; letter-spacing: 5px; font-variant-caps: all-small-caps; color: #555; }
+  .part .sep { color: transparent; font-size: 1px; line-height: 0; white-space: pre; }
+  .part .pt { display: block; font-size: 24pt; line-height: 1.25; margin-top: 14px; }
+  .part p { font-style: italic; margin-left: 3em; margin-right: 3em; }
+  .dedication i, .epigraph i, .part p i { font-style: normal; }
+  .opener { padding-top: 28vh; }
+  .opener .hd { font-size: 26pt; font-weight: normal; line-height: 1.25; margin: 0; }
+  .opener .sub { font-style: italic; color: #555; margin-top: 12px; }
+  .opener .byline { margin-top: 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 10pt; }
+  .contents { page-break-before: always; }
+  .contents ol { list-style: none; margin: 0 1.5em; padding: 0; }
+  .contents li { margin: 0.3em 0; }
+  .contents a { display: flex; align-items: baseline; color: inherit; text-decoration: none; }
+  .contents .toc-t { flex: 1; }
+  .contents .toc-pg { flex: none; width: 3em; text-align: right; font-size: 13pt; font-variant-numeric: lining-nums tabular-nums; }
+  .contents li.lv1 { margin-left: 1.6em; }
+  .contents li.lv2 { margin-left: 3.2em; }
+  .contents li.t-part { margin-top: 1.1em; font-size: 15pt; line-height: 1.5; letter-spacing: 2px; font-variant-caps: all-small-caps; }
+  .contents li:not(.t-page) + li.t-page { margin-top: 1.2em; }
   .prov { margin-top: 80px; text-align: center; color: #999; font-size: 9pt; }
+  /* printed pages carry their number at the foot; the cover, the title
+     page and the pages that aren't chapters don't, the way books do it
+     (only the PDF uses these rules) */
+  @page { @bottom-center { content: counter(page); font-family: ${exportBodyFont()}; font-size: 9pt; color: #777; } }
+  @page front { @bottom-center { content: none; } }
+  .coverpage, .titlepage, .page, .contents { page: front; }
 </style></head><body>
 ${opts.cover ? `<div class="coverpage"><img src="data:${opts.cover.mime};base64,${opts.cover.base64}" alt="${t('Cover')}"/></div>` : ''}
 <div class="titlepage"><h1>${escHtml(d.title)}</h1>
 ${d.subtitle ? `<p class="sub">${escHtml(d.subtitle)}</p>` : ''}
 <p class="auth">${escHtml(d.author)}</p></div>
-${chaptersHtml}
+${body}
 ${opts.stamp ? `<p class="prov">${t('{n} words · exported from NEO on {date}', { n: total, date: stamp })}</p>` : ''}
 </body></html>`;
 }
@@ -5162,9 +7034,12 @@ const escXml = (s) => String(s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 
-// Walk a paragraph's DOM and emit [{text, b, i}] so docx/epub get real bold/italic
-function paraRuns(pHtml) {
-  const holder = document.createElement('div');
+// Walk a paragraph's DOM and emit [{text, b, i}] so docx/epub get real bold/italic.
+// In the manuscript an italic inside an italic is emphasis in a poetry
+// paragraph (itself one italic), and it is set upright, the typesetter's
+// way (flip). Pasted HTML often doubles its italics for nothing; not there.
+function paraRuns(pHtml, flip) {
+  const holder = document.createElement('template'); // inert: nothing loads or runs
   holder.innerHTML = pHtml;
   const runs = [];
   const walk = (node, b, i) => {
@@ -5177,25 +7052,39 @@ function paraRuns(pHtml) {
           continue;
         }
         const tag = child.tagName;
-        walk(child, b || tag === 'B' || tag === 'STRONG', i || tag === 'I' || tag === 'EM');
+        const it = tag === 'I' || tag === 'EM';
+        walk(child, b || tag === 'B' || tag === 'STRONG', it ? (flip ? !i : true) : i);
       }
     }
   };
-  walk(holder, false, false);
+  walk(holder.content, false, false);
   return runs;
 }
 
 /* ---------- DOCX ---------- */
 
 function docxP(runs, opts = {}) {
+  // the schema wants a paragraph's properties in this order
   const pPr = [];
+  if (opts.style) pPr.push(`<w:pStyle w:val="${opts.style}"/>`);
+  if (opts.keepNext) pPr.push('<w:keepNext/>');
   if (opts.pageBreak) pPr.push('<w:pageBreakBefore/>');
-  if (opts.align) pPr.push(`<w:jc w:val="${opts.align}"/>`);
-  if (opts.indent) pPr.push('<w:ind w:firstLine="480"/>');
+  if (opts.spaceBefore || opts.spaceAfter) {
+    pPr.push(`<w:spacing${opts.spaceBefore ? ` w:before="${opts.spaceBefore}"` : ''}${opts.spaceAfter ? ` w:after="${opts.spaceAfter}"` : ''} w:line="360" w:lineRule="auto"/>`);
+  }
   if (opts.poetry) pPr.push('<w:ind w:left="720" w:right="720"/>');
-  if (opts.spaceBefore) pPr.push(`<w:spacing w:before="${opts.spaceBefore}" w:line="360" w:lineRule="auto"/>`);
+  else if (opts.indentLeft) pPr.push(`<w:ind w:left="${opts.indentLeft}"/>`);
+  else if (opts.indent) pPr.push('<w:ind w:firstLine="480"/>');
+  if (opts.align) pPr.push(`<w:jc w:val="${opts.align}"/>`);
   const rXml = runs.map((r) => {
-    const rPr = (r.b ? '<w:b/>' : '') + (r.i ? '<w:i/>' : '') + (opts.size ? `<w:sz w:val="${opts.size}"/>` : '');
+    if (r.br) return '<w:r><w:br/></w:r>';
+    const it = opts.flip ? !r.i : r.i;
+    const caps = r.caps !== undefined ? r.caps : opts.caps;
+    const size = r.size || opts.size;
+    const rPr = (r.b ? '<w:b/>' : '') + (it ? '<w:i/>' : '')
+      + (caps === true ? '<w:caps/>' : caps === false ? '<w:caps w:val="0"/>' : '')
+      + (opts.tracking ? `<w:spacing w:val="${opts.tracking}"/>` : '')
+      + (size ? `<w:sz w:val="${size}"/>` : '');
     return `<w:r>${rPr ? '<w:rPr>' + rPr + '</w:rPr>' : ''}<w:t xml:space="preserve">${escXml(r.text)}</w:t></w:r>`;
   }).join('');
   return `<w:p><w:pPr>${pPr.join('')}</w:pPr>${rXml}</w:p>`;
@@ -5204,13 +7093,55 @@ function docxP(runs, opts = {}) {
 function buildDocxEntries(data) {
   const d = data || bookExportData();
   const body = [];
+  // headings carry Word's own heading styles, so the navigation pane and a
+  // table of contents inserted in Word both see the book's shape
+  const heading = (ch) => 'Heading' + Math.min(3, 1 + (ch.level || 0));
+  // a page's lines: centered, upright where the page is italic
+  const pageLines = (paras, italic, first) => paras.forEach((p, i) => {
+    const lead = i === 0 ? first : {};
+    if (p.sceneBreak) { body.push(docxP([{ text: '***' }], Object.assign({ align: 'center' }, lead))); return; }
+    const attr = isAttribution(p);
+    body.push(docxP(paraRuns(p.html), Object.assign({ align: 'center', flip: italic && !attr, size: attr ? 20 : undefined, spaceBefore: attr ? 240 : 0 }, lead)));
+  });
   // title page
   body.push(docxP([{ text: d.title, b: true }], { align: 'center', spaceBefore: 3000, size: 56 }));
   if (d.subtitle) body.push(docxP([{ text: d.subtitle, i: true }], { align: 'center', size: 32 }));
   body.push(docxP([{ text: d.author }], { align: 'center', spaceBefore: 800 }));
+  const contents = () => {
+    body.push(docxP([{ text: t('Contents') }], { align: 'center', pageBreak: true, spaceBefore: 1200, size: 28, caps: true }));
+    body.push(docxP([], {}));
+    for (const e of d.toc.filter((x) => d.contentsChapters || x.type !== 'chapter')) {
+      body.push(docxP([{ text: e.label }], { indentLeft: 480 * e.level, spaceBefore: e.type === 'part' ? 240 : 0, caps: e.type === 'part' }));
+    }
+  };
+  let placed = !(d.contents && d.toc && d.toc.length);
   d.sections.forEach((ch) => {
+    if (!placed && !ch.front) { contents(); placed = true; }
+    const kind = ch.kind || 'chapter';
+    if (kind === 'copyright') {
+      ch.paras.forEach((p, i) => body.push(docxP(p.sceneBreak ? [] : paraRuns(p.html), { pageBreak: i === 0, spaceBefore: i === 0 ? 6000 : 0, spaceAfter: 120, size: 18 })));
+      return;
+    }
+    if (kind === 'dedication' || kind === 'epigraph') {
+      pageLines(ch.paras, true, { pageBreak: true, spaceBefore: kind === 'dedication' ? 3600 : 3200 });
+      return;
+    }
+    if (kind === 'part') {
+      const runs = [{ text: ch.heading }];
+      if (ch.partTitle) runs.push({ br: true }, { br: true }, { text: ch.partTitle, caps: false, size: 48 });
+      body.push(docxP(runs, { style: heading(ch), spaceBefore: 3600, spaceAfter: 480 }));
+      pageLines(ch.paras, true, {});
+      return;
+    }
+    if (kind === 'opener') {
+      body.push(docxP([{ text: ch.heading, caps: false, size: 44 }], { style: heading(ch), spaceBefore: 3600 }));
+      if (ch.subtitle) body.push(docxP([{ text: ch.subtitle, i: true }], { align: 'center', size: 28 }));
+      if (ch.byline) body.push(docxP([{ text: ch.byline }], { align: 'center', spaceBefore: 600, size: 20, caps: true }));
+      return;
+    }
     if (ch.heading) {
-      body.push(docxP([{ text: ch.heading.toUpperCase(), b: false }], { align: 'center', pageBreak: true, spaceBefore: 1200, size: 28 }));
+      body.push(docxP([{ text: ch.heading }], { style: heading(ch) }));
+      if (ch.byline) body.push(docxP([{ text: ch.byline }], { align: 'center', size: 20, caps: true }));
       body.push(docxP([], {}));
     } else {
       body.push(docxP([], { pageBreak: true })); // headingless story still starts fresh
@@ -5222,14 +7153,19 @@ function buildDocxEntries(data) {
       else body.push(docxP(paraRuns(p.html), { indent: true }));
     }
   });
+  if (!placed) contents();
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body.join('')}
 <w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
 </w:body></w:document>`;
+  const headingStyle = (n) => `<w:style w:type="paragraph" w:styleId="Heading${n}"><w:name w:val="heading ${n}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/>
+<w:pPr><w:keepNext/><w:pageBreakBefore/><w:spacing w:before="1200"/><w:jc w:val="center"/><w:outlineLvl w:val="${n - 1}"/></w:pPr><w:rPr><w:caps/><w:sz w:val="28"/></w:rPr></w:style>`;
   const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia"/><w:sz w:val="24"/></w:rPr></w:rPrDefault>
 <w:pPrDefault><w:pPr><w:spacing w:line="360" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>
+${[1, 2, 3].map(headingStyle).join('\n')}
 </w:styles>`;
   return [
     { path: '[Content_Types].xml', content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -5267,31 +7203,60 @@ async function exportCover(d) {
   return { base64: url.split(',')[1], mime: 'image/jpeg', ext: 'jpg' };
 }
 
+// what each kind of section is, in the EPUB's own words
+const EPUB_TYPES = {
+  copyright: 'copyright-page', dedication: 'dedication', epigraph: 'epigraph', part: 'part',
+  opener: 'volume', acknowledgments: 'acknowledgments', about: 'backmatter'
+};
+
 function chapterXhtml(ch, d) {
-  let first = true;
-  const paras = ch.paras.map((p) => {
-    if (p.sceneBreak) { first = true; return '<p class="brk">* * *</p>'; }
-    const classes = [];
-    if (p.poetry) classes.push('poetry');
-    else if (first) classes.push('first');
-    if (p.align === 'center' || p.align === 'right') classes.push(p.align);
-    const cls = classes.length ? ` class="${classes.join(' ')}"` : '';
-    if (!p.poetry) first = false;
-    const inner = paraRuns(p.html).map((r) => {
-      let t = escXml(r.text);
-      if (r.i) t = '<em>' + t + '</em>';
-      if (r.b) t = '<strong>' + t + '</strong>';
-      return t;
-    }).join('');
-    return `<p${cls}>${inner}</p>`;
+  const kind = ch.kind || 'chapter';
+  const xhtmlRuns = (p) => paraRuns(p.html).map((r) => {
+    let t = escXml(r.text);
+    if (r.i) t = '<em>' + t + '</em>';
+    if (r.b) t = '<strong>' + t + '</strong>';
+    return t;
+  }).join('');
+  // a page's lines, each set on its own
+  const lines = () => ch.paras.map((p) => {
+    if (p.sceneBreak) return '<p class="brk">* * *</p>';
+    const cls = [kind !== 'copyright' && isAttribution(p) ? 'attr' : '', p.poetry ? 'poetry' : '', p.align === 'center' || p.align === 'right' ? p.align : ''].filter(Boolean);
+    return `<p${cls.length ? ` class="${cls.join(' ')}"` : ''}>${xhtmlRuns(p)}</p>`;
   }).join('\n');
+  let inner;
+  if (kind === 'copyright' || kind === 'dedication' || kind === 'epigraph') {
+    inner = `<section epub:type="${EPUB_TYPES[kind]}" class="${kind}">
+${lines()}
+</section>`;
+  } else if (kind === 'part') {
+    inner = `<section epub:type="part" class="part"><h1><span class="pl">${escXml(ch.heading)}</span>${ch.partTitle ? `<span class="pt">${escXml(ch.partTitle)}</span>` : ''}</h1>
+${lines()}
+</section>`;
+  } else if (kind === 'opener') {
+    inner = `<section epub:type="volume" class="opener"><h1>${escXml(ch.heading)}</h1>
+${ch.subtitle ? `<p class="sub">${escXml(ch.subtitle)}</p>` : ''}${ch.byline ? `<p class="byline">${escXml(ch.byline)}</p>` : ''}
+</section>`;
+  } else {
+    let first = true;
+    const paras = ch.paras.map((p) => {
+      if (p.sceneBreak) { first = true; return '<p class="brk">* * *</p>'; }
+      const classes = [];
+      if (p.poetry) classes.push('poetry');
+      else if (first) classes.push('first');
+      if (p.align === 'center' || p.align === 'right') classes.push(p.align);
+      const cls = classes.length ? ` class="${classes.join(' ')}"` : '';
+      if (!p.poetry) first = false;
+      return `<p${cls}>${xhtmlRuns(p)}</p>`;
+    }).join('\n');
+    inner = `<section epub:type="${EPUB_TYPES[kind] || ch.role || 'chapter'}">${ch.heading ? `<h1>${escXml(ch.heading)}</h1>` : ''}${ch.byline ? `<p class="byline">${escXml(ch.byline)}</p>` : ''}
+${paras}
+</section>`;
+  }
   return `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-<head><title>${escXml(ch.heading || d.title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
-<body><section epub:type="chapter">${ch.heading ? `<h1>${escXml(ch.heading)}</h1>` : ''}
-${paras}
-</section></body></html>`;
+<head><title>${escXml(ch.heading || ch.label || d.title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body>${inner}</body></html>`;
 }
 
 async function buildEpubEntries(data) {
@@ -5305,12 +7270,27 @@ async function buildEpubEntries(data) {
   const coverName = 'cover.' + cover.ext;
   const coverMime = cover.mime;
   const coverContent = cover.base64;
+  // the pages at the front come before the contents in reading order
+  const front = chapters.filter((ch) => ch.front);
+  const rest = chapters.filter((ch) => !ch.front);
+  const start = rest[0] || chapters[0];
   const chItems = chapters.map((ch) =>
     `<item id="ch${ch.num}" href="ch${ch.num}.xhtml" media-type="application/xhtml+xml"/>`).join('\n');
-  const chSpine = chapters.map((ch) => `<itemref idref="ch${ch.num}"/>`).join('\n');
-  const navPoints = chapters.map((ch) => `<li><a href="ch${ch.num}.xhtml">${escXml(ch.heading || d.title)}</a></li>`).join('\n');
-  const ncxPoints = chapters.map((ch) => `
-<navPoint id="ch${ch.num}" playOrder="${ch.num + 1}"><navLabel><text>${escXml(ch.heading || d.title)}</text></navLabel><content src="ch${ch.num}.xhtml"/></navPoint>`).join('');
+  const spineOf = (list) => list.map((ch) => `<itemref idref="ch${ch.num}"/>`).join('\n');
+  // one entry per section for a single book; a book of books nests its
+  // chapters under their titles and its titles under their parts
+  const toc = tocTree(d.toc || chapters.map((ch) => ({ label: ch.heading || d.title, num: ch.num, level: 0 })));
+  const navList = (nodes) => nodes.map((n) => `<li><a href="ch${n.e.num}.xhtml">${escXml(n.e.label)}</a>${n.children.length ? `
+<ol>
+${navList(n.children)}
+</ol>` : ''}</li>`).join('\n');
+  let playOrder = 1; // the title page is first
+  const ncxPoints = (nodes) => nodes.map((n) => {
+    playOrder += 1;
+    return `
+<navPoint id="ch${n.e.num}" playOrder="${playOrder}"><navLabel><text>${escXml(n.e.label)}</text></navLabel><content src="ch${n.e.num}.xhtml"/>${ncxPoints(n.children)}</navPoint>`;
+  }).join('');
+  const entryCount = (nodes) => nodes.reduce((n, x) => n + 1 + entryCount(x.children), 0);
 
   const entries = [
     { path: 'mimetype', content: 'application/epub+zip', store: true },
@@ -5340,13 +7320,13 @@ ${chItems}
 <spine toc="ncx">
 <itemref idref="cover" linear="no"/>
 <itemref idref="titlepage"/>
-<itemref idref="nav"${chapters.length === 1 ? ' linear="no"' : ''}/>
-${chSpine}
+${front.length ? spineOf(front) + '\n' : ''}<itemref idref="nav"${entryCount(toc) <= 1 ? ' linear="no"' : ''}/>
+${spineOf(rest)}
 </spine>
 <guide>
 <reference type="cover" title="${escXml(t('Cover'))}" href="cover.xhtml"/>
 <reference type="toc" title="${escXml(t('Table of Contents'))}" href="nav.xhtml"/>
-<reference type="text" title="${escXml(t('Beginning'))}" href="ch1.xhtml"/>
+<reference type="text" title="${escXml(t('Beginning'))}" href="ch${start.num}.xhtml"/>
 </guide>
 </package>` },
     { path: 'OEBPS/nav.xhtml', content: `<?xml version="1.0" encoding="utf-8"?>
@@ -5356,12 +7336,12 @@ ${chSpine}
 <body><nav epub:type="toc" id="toc"><h1>${escXml(t('Contents'))}</h1>
 <ol>
 <li><a href="title.xhtml">${escXml(t('Title Page'))}</a></li>
-${navPoints}
+${navList(toc)}
 </ol></nav>
 <nav epub:type="landmarks" hidden=""><ol>
 <li><a epub:type="cover" href="cover.xhtml">${escXml(t('Cover'))}</a></li>
 <li><a epub:type="toc" href="nav.xhtml">${escXml(t('Table of Contents'))}</a></li>
-<li><a epub:type="bodymatter" href="ch1.xhtml">${escXml(t('Beginning'))}</a></li>
+<li><a epub:type="bodymatter" href="ch${start.num}.xhtml">${escXml(t('Beginning'))}</a></li>
 </ol></nav>
 </body></html>` },
     { path: 'OEBPS/toc.ncx', content: `<?xml version="1.0" encoding="utf-8"?>
@@ -5369,18 +7349,35 @@ ${navPoints}
 <head><meta name="dtb:uid" content="${uuid}"/></head>
 <docTitle><text>${escXml(d.title)}</text></docTitle>
 <navMap>
-<navPoint id="titlepage" playOrder="1"><navLabel><text>${escXml(t('Title Page'))}</text></navLabel><content src="title.xhtml"/></navPoint>${ncxPoints}
+<navPoint id="titlepage" playOrder="1"><navLabel><text>${escXml(t('Title Page'))}</text></navLabel><content src="title.xhtml"/></navPoint>${ncxPoints(toc)}
 </navMap></ncx>` },
     { path: 'OEBPS/style.css', content: `body { font-family: serif; line-height: 1.5; margin: 1em; }
 h1 { text-align: center; font-weight: normal; letter-spacing: 0.2em; text-transform: uppercase; font-size: 1.2em; margin: 3em 0 2em; }
 p { text-indent: 1.2em; margin: 0; }
-p.first, p.brk + p { text-indent: 0; }
+p.first, p.brk + p, p.byline + p { text-indent: 0; }
 p.center { text-align: center; text-indent: 0; }
 p.right { text-align: right; text-indent: 0; }
 p.brk { text-align: center; text-indent: 0; margin: 2.5em 0; letter-spacing: 0.5em; }
 p.poetry { text-indent: 0; margin: 0 2em; }
 p:not(.poetry) + p.poetry, h1 + p.poetry { margin-top: 0.9em; }
 p.poetry + p:not(.poetry) { margin-top: 0.9em; }
+p.byline { text-align: center; text-indent: 0; letter-spacing: 0.2em; text-transform: uppercase; font-size: 0.8em; margin: -1em 0 2em; }
+.copyright { margin-top: 40%; font-size: 0.8em; line-height: 1.5; }
+.copyright p { text-indent: 0; margin: 0 0 0.9em; }
+.dedication, .epigraph, .part, .opener { text-align: center; margin-top: 30%; }
+.epigraph { margin-left: 2em; margin-right: 2em; }
+.dedication p, .epigraph p, .part p { text-indent: 0; margin: 0 0 0.5em; font-style: italic; }
+.dedication em, .epigraph em, .part p em { font-style: normal; }
+.dedication p.poetry, .epigraph p.poetry, .part p.poetry { margin: 0 0 0.2em; }
+p.attr { font-style: normal; font-size: 0.85em; letter-spacing: 0.05em; margin-top: 1em; }
+.part h1 { margin: 0 0 2em; }
+.part .pl { display: block; }
+.part .pt { display: block; margin-top: 0.8em; font-size: 1.6em; letter-spacing: 0; text-transform: none; }
+.opener h1 { margin: 0; font-size: 1.8em; letter-spacing: 0.02em; text-transform: none; }
+.opener .sub { text-indent: 0; margin-top: 0.6em; font-style: italic; }
+.opener .byline { margin: 3em 0 0; }
+nav#toc ol { list-style: none; padding-left: 0; }
+nav#toc ol ol { padding-left: 1.5em; }
 .titlepage { text-align: center; margin-top: 30%; }
 .titlepage h2 { font-size: 2em; margin: 0; }
 .titlepage .sub { font-style: italic; }
@@ -5407,74 +7404,294 @@ ${d.subtitle ? `<p class="sub">${escXml(d.subtitle)}</p>` : ''}
   return entries;
 }
 
-/* ---------- ANTHOLOGY: a whole shelf becomes one book ---------- */
+/* ---------- A BOOK OF BOOKS: a bound shelf, or a shelf as an anthology ---------- */
 
-// Read every book on a shelf from disk and merge into export sections.
-// Each story's title becomes its TOC entry; multi-chapter works keep
-// their chapters as continuation sections.
-async function shelfExportData(shelf, anthologyTitle) {
+// Read a shelf from disk into export sections, in shelf order. Each section
+// has a kind the builders lay out: 'copyright', 'dedication', 'epigraph'
+// (front pages), 'part', 'opener' (a title's own first page), 'chapter',
+// 'acknowledgments', 'about' (back pages). `toc` is the table of contents:
+// {label, num (the section), level, type: part | title | chapter | page}.
+// A bound shelf brings its cover and pages and numbers its chapters its own
+// way; an unbound shelf is read as an anthology: titles only, each one's
+// chapters counted from 1.
+async function shelfBookData(shelf, opts = {}) {
+  const bound = !!opts.bound;
+  const through = bound && ((shelf.binding && shelf.binding.numbering) || 'through') !== 'restart';
+  const metas = [];
+  for (const id of shelf.bookIds) {
+    const m = await window.neo.readBookMeta(id);
+    if (m && (bound || !isPageMeta(m))) metas.push(m);
+  }
+  const cover = metas.find((m) => m.kind === 'cover') || null;
+  const author = (cover && cover.author) || shelfAuthorName(shelf);
+  const titles = metas.filter((m) => !isPageMeta(m));
+  const single = titles.length === 1;
+  const pageParas = async (m) => parasFromHtml(m.chapterOrder && m.chapterOrder[0]
+    ? await window.neo.readChapter(m.id, m.chapterOrder[0]) : '');
   const sections = [];
-  let num = 0;
-  for (const bookId of shelf.bookIds) {
-    const meta = await window.neo.readBookMeta(bookId);
-    if (!meta || !meta.chapterOrder) continue;
-    const multi = meta.chapterOrder.length > 1;
-    for (let i = 0; i < meta.chapterOrder.length; i++) {
-      const html = await window.neo.readChapter(bookId, meta.chapterOrder[i]);
-      const paras = parasFromHtml(html);
+  const toc = [];
+  const push = (s) => { s.num = sections.length + 1; sections.push(s); return s; };
+  let n = 0; // the chapter count
+  let parts = 0;
+  let inPart = false;
+  for (const m of metas) {
+    if (m.kind === 'cover') continue;
+    if (PAGE_FRONT.includes(m.kind) || PAGE_BACK.includes(m.kind)) {
+      const paras = await pageParas(m);
+      if (!paras.length) continue; // a page left blank stays out of the book
+      const back = PAGE_BACK.includes(m.kind);
+      const s = push({ kind: m.kind, front: !back, heading: back ? pageKindName(m.kind) : '', label: pageKindName(m.kind), level: 0, paras });
+      if (back) {
+        toc.push({ label: s.heading, num: s.num, level: 0, type: 'page' });
+        inPart = false;
+      }
+      continue;
+    }
+    if (m.kind === 'part') {
+      parts += 1;
+      const all = await pageParas(m);
+      // the page's first line is the part's title; what follows, a quote or a verse
+      const titled = !!(all[0] && !all[0].sceneBreak && !isAttribution(all[0]));
+      const partTitle = titled ? all[0].text : '';
+      const s = push({ kind: 'part', heading: partLabel(parts), partTitle, level: 0, paras: titled ? all.slice(1) : all });
+      toc.push({ label: partTitle ? s.heading + ': ' + partTitle : s.heading, num: s.num, level: 0, type: 'part' });
+      inPart = true;
+      continue;
+    }
+    if (PAGE_WRITTEN.includes(m.kind)) {
+      // the book's own prologue or epilogue: one unnumbered section (any
+      // chapters the writer gave it run on, a scene break between them)
+      const paras = [];
+      for (const chId of m.chapterOrder || []) {
+        const p = parasFromHtml(await window.neo.readChapter(m.id, chId));
+        if (!p.length) continue;
+        if (paras.length) paras.push({ sceneBreak: true, poetry: false, text: '', runs: [], align: '', html: '' });
+        paras.push(...p);
+      }
       if (!paras.length) continue;
-      num++;
-      const chTitle = (meta.chapterTitles || {})[meta.chapterOrder[i]];
-      const heading = !multi
-        ? meta.title
-        : (i === 0 ? meta.title : `${meta.title} — ${t('Chapter {n}', { n: i + 1 })}${chTitle ? ': ' + chTitle : ''}`);
-      sections.push({ num, heading, paras });
+      const heading = isUntitled(m.title) ? pageKindName(m.kind) : m.title.trim();
+      const s = push({ kind: 'chapter', role: m.kind, heading, level: 0, paras });
+      toc.push({ label: heading, num: s.num, level: 0, type: 'title' });
+      inPart = false;
+      continue;
+    }
+    // a title and its chapters: its story and its parts. The pages it
+    // carries as a book of its own (its copyright, its dedication…) stay
+    // with it; the bound book has pages of its own.
+    if (!through) n = 0;
+    const level = inPart ? 1 : 0;
+    const chapters = [];
+    for (const chId of m.chapterOrder || []) {
+      const kind = chapterKind(chId, m);
+      if (!STORY_KINDS.includes(kind) && kind !== 'part') continue;
+      const paras = parasFromHtml(await window.neo.readChapter(m.id, chId));
+      if (paras.length || kind === 'part') chapters.push({ chId, kind, paras });
+    }
+    while (chapters.length && chapters[chapters.length - 1].kind === 'part') chapters.pop();
+    if (!chapters.length) continue;
+    const byline = m.author && m.author !== author ? m.author : '';
+    if (single && chapters.length === 1) {
+      push({ kind: 'chapter', heading: '', paras: chapters[0].paras });
+      continue;
+    }
+    if (chapters.length === 1) {
+      // one chapter is one section, headed by the title's own name and left
+      // out of the count: a prologue, an interlude, a short story
+      const s = push({ kind: 'chapter', heading: m.title, byline, level, paras: chapters[0].paras });
+      toc.push({ label: m.title, num: s.num, level, type: 'title' });
+      continue;
+    }
+    let chLevel = level;
+    if (!single) {
+      const s = push({ kind: 'opener', heading: m.title, subtitle: m.subtitle || '', byline, level, paras: [] });
+      toc.push({ label: m.title, num: s.num, level, type: 'title' });
+      chLevel = level + 1;
+    }
+    // a title's own parts stand over the chapters that follow them
+    let titleParts = 0;
+    let underPart = false;
+    for (const c of chapters) {
+      if (c.kind === 'part') {
+        titleParts += 1;
+        const titled = !!(c.paras[0] && !c.paras[0].sceneBreak && !isAttribution(c.paras[0]));
+        const partTitle = titled ? c.paras[0].text : '';
+        const s = push({ kind: 'part', heading: partLabel(titleParts), partTitle, level: chLevel, paras: titled ? c.paras.slice(1) : c.paras });
+        toc.push({ label: partTitle ? s.heading + ': ' + partTitle : s.heading, num: s.num, level: chLevel, type: 'part' });
+        underPart = true;
+        continue;
+      }
+      const role = chapterRole(c.chId, m);
+      if (role === 'epilogue') underPart = false;
+      const chTitle = (m.chapterTitles || {})[c.chId];
+      let heading;
+      if (role) heading = role === 'prologue' ? t('Prologue') : t('Epilogue');
+      else { n += 1; heading = t('Chapter {n}', { n }); }
+      if (chTitle) heading = library.exportCustomChapterTitles ? chTitle : heading + ' — ' + chTitle;
+      const lv = underPart ? chLevel + 1 : chLevel;
+      const s = push({ kind: 'chapter', heading, level: lv, paras: c.paras, role: role || '' });
+      toc.push({ label: heading, num: s.num, level: lv, type: 'chapter' });
     }
   }
+  // an EPUB wants one identity per book: a bound book keeps the first it gets
+  let uuid = null;
+  if (bound) {
+    if (!shelf.binding.uuid) {
+      shelf.binding.uuid = crypto.randomUUID();
+      await writeLibrary(library);
+    }
+    uuid = shelf.binding.uuid;
+  }
+  const title = opts.title || shelf.name;
   return {
-    id: 'shelf-' + shelf.id,
-    title: anthologyTitle,
-    subtitle: '',
-    author: displayAuthor(),
-    coverSeed: shelf.id + ':' + anthologyTitle,
-    sections
+    id: cover && cover.coverImage ? cover.id : 'shelf-' + shelf.id,
+    uuid,
+    title,
+    subtitle: (cover && cover.subtitle) || '',
+    author,
+    language: writingLanguage(),
+    coverSeed: cover ? cover.coverSeed : shelf.id + ':' + title,
+    coverImage: (cover && cover.coverImage) || null,
+    sections,
+    toc,
+    // a contents page in print for a book of several titles, or for one
+    // title that has a Contents page of its own (which lists its chapters)
+    contents: titles.length > 1 || (single && (titles[0].chapterOrder || []).some((c) => chapterKind(c, titles[0]) === 'contents')),
+    contentsChapters: single
   };
+}
+
+async function shelfPayload(data, format) {
+  const defaultName = safeName(data.title);
+  if (format === 'docx') return { format, defaultName, zipEntries: buildDocxEntries(data) };
+  if (format === 'epub') return { format, defaultName, zipEntries: await buildEpubEntries(data) };
+  return { format: 'pdf', defaultName, content: buildHtml(data, { cover: await exportCover(data), fonts: await exportFontFaces(data) }) };
+}
+
+function shelfFormats() {
+  return [
+    { label: 'EPUB', desc: t('For ebook stores — the TOC lists every story.'), value: 'epub' },
+    { label: 'Word (.docx)', desc: t('For editors — each story starts on a new page.'), value: 'docx' },
+    { label: 'PDF', desc: t('For reading, sharing, and print.'), value: 'pdf' }
+  ];
 }
 
 async function exportShelfAnthology(shelf) {
   if (!shelf.bookIds.length) { toast(t('This shelf has no books on it yet')); return; }
   const title = await askInput(t('Anthology title'), t('Shown on the title page, cover, and metadata'), shelf.name);
   if (title === null) return;
-  const format = await optionModal(t('Export the anthology as…'), null, [
-    { label: 'EPUB', desc: t('For ebook stores — the TOC lists every story.'), value: 'epub' },
-    { label: 'Word (.docx)', desc: t('For editors — each story starts on a new page.'), value: 'docx' },
-    { label: 'PDF', desc: t('For reading, sharing, and print.'), value: 'pdf' }
-  ]);
+  const format = await optionModal(t('Export the anthology as…'), null, shelfFormats());
   if (!format) return;
   toast(t('Collecting the shelf…'));
-  const data = await shelfExportData(shelf, title || shelf.name);
-  if (!data.sections.length) { toast(t('No words found on this shelf yet')); return; }
-  const defaultName = safeName(data.title);
-  let payload;
-  if (format === 'docx') payload = { format, defaultName, zipEntries: buildDocxEntries(data) };
-  else if (format === 'epub') payload = { format, defaultName, zipEntries: await buildEpubEntries(data) };
-  else payload = { format: 'pdf', defaultName, content: buildHtml(data, { cover: await exportCover(data) }) };
-  const saved = await window.neo.exportSave(payload);
-  if (saved) toast(t('Anthology of {n} works exported: {file}', { n: shelf.bookIds.length, file: saved.split('/').pop() }), 6000);
+  try {
+    const data = await shelfBookData(shelf, { title: title || shelf.name });
+    if (!data.sections.length) { toast(t('No words found on this shelf yet')); return; }
+    const saved = await window.neo.exportSave(await shelfPayload(data, format));
+    if (saved) toast(t('Anthology of {n} works exported: {file}', { n: shelf.bookIds.length, file: saved.split('/').pop() }), 6000);
+  } catch (err) {
+    window.neo.logError('export anthology: ' + (err && err.stack || err));
+    toast(t('Couldn’t export the anthology: {error}', { error: plainError(err) }), 8000);
+  }
+}
+
+// A bound shelf goes out as the book it is: no questions but the format
+async function exportBoundBook(shelf) {
+  const format = await optionModal(escHtml(t('Export “{title}”', { title: shelf.name })), null, shelfFormats());
+  if (!format) return;
+  toast(t('Collecting the shelf…'));
+  try {
+    const data = await shelfBookData(shelf, { bound: true });
+    if (!data.sections.length) { toast(t('No words found on this shelf yet')); return; }
+    const saved = await window.neo.exportSave(await shelfPayload(data, format));
+    if (saved) toast(t('Exported: {file}', { file: saved.split('/').pop() }));
+  } catch (err) {
+    window.neo.logError('export bound book: ' + (err && err.stack || err));
+    toast(t('Couldn’t export: {error}', { error: plainError(err) }), 8000);
+  }
+}
+
+// Right-click a bound book's cover: its art, and the book's own choices
+async function boundCoverMenu(shelf, meta, el) {
+  const options = [];
+  if (!NO_HOVER) {
+    options.push({ label: meta.coverImage ? t('Replace cover art…') : t('Set cover art…'), desc: t('Pick an image (2:3 works best). Or just drag one from Finder onto the book.'), value: 'cover' });
+  }
+  if (meta.coverImage) {
+    options.push({ label: t('Remove cover art'), desc: t('Deletes the image from the book folder. (To just hide it, use the ↻ on the book.)'), danger: true, value: 'uncover' });
+  }
+  options.push(
+    { label: t('New cover'), value: 'refresh' },
+    { label: t('Export the book…'), desc: t('EPUB, Word or PDF, with its cover, its pages and one table of contents.'), value: 'export' },
+    { label: t('Unbind'), desc: t('A shelf of separate titles again. Its pages wait for the next binding.'), value: 'unbind' }
+  );
+  const choice = await optionModal(escHtml(t('“{name}” · one book', { name: shelf.name })), null, options);
+  if (choice === 'cover') {
+    const src = await window.neo.pickCover();
+    if (!src) return;
+    const fname = await window.neo.setCover(meta.id, src);
+    if (!fname) return;
+    const live = (await window.neo.readBookMeta(meta.id)) || meta;
+    live.coverImage = fname;
+    live.coverMode = 'image';
+    await writeBookMeta(meta.id, live);
+    renderShelves();
+  } else if (choice === 'uncover') {
+    await window.neo.removeCover(meta.id);
+    const live = (await window.neo.readBookMeta(meta.id)) || meta;
+    live.coverImage = null;
+    await writeBookMeta(meta.id, live);
+    renderShelves();
+  } else if (choice === 'refresh') {
+    await refreshCover(meta, el);
+  } else if (choice === 'export') {
+    await exportBoundBook(shelf);
+  } else if (choice === 'unbind') {
+    await unbindShelf(shelf);
+  }
+}
+
+// flat {level} entries into a tree, for the EPUB's nested contents
+function tocTree(entries) {
+  const root = { children: [] };
+  const stack = [root];
+  for (const e of entries) {
+    const level = Math.max(0, Math.min(e.level, stack.length - 1));
+    stack.length = level + 1;
+    const node = { e, children: [] };
+    stack[level].children.push(node);
+    stack.push(node);
+  }
+  return root.children;
+}
+
+
+// What went wrong, in the words a writer can use: Electron wraps a failure in
+// the main process as "Error invoking remote method 'export:save': Error: …"
+function plainError(err) {
+  return String((err && err.message) || err).replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
 }
 
 async function doExport(format) {
   if (!book) { toast(t('Open a book first')); return; }
   flushAllSaves();
   const defaultName = safeName(book.title);
-  let payload;
-  if (format === 'docx') payload = { format, defaultName, zipEntries: buildDocxEntries() };
-  else if (format === 'epub') payload = { format, defaultName, zipEntries: await buildEpubEntries() };
-  else if (format === 'txt') payload = { format, defaultName, content: buildTxt() };
-  else if (format === 'md') payload = { format, defaultName, content: buildMd() };
-  else payload = { format, defaultName, content: buildHtml(null, { cover: await exportCover(bookExportData()) }) };
-  const saved = await window.neo.exportSave(payload);
-  if (saved) toast(t('Exported: {file}', { file: saved.split('/').pop() }));
+  try {
+    let payload;
+    if (format === 'docx') payload = { format, defaultName, zipEntries: buildDocxEntries() };
+    else if (format === 'epub') payload = { format, defaultName, zipEntries: await buildEpubEntries() };
+    else if (format === 'txt') payload = { format, defaultName, content: buildTxt() };
+    else if (format === 'md') payload = { format, defaultName, content: buildMd() };
+    else {
+      const data = bookExportData();
+      payload = { format, defaultName, content: buildHtml(data, { cover: await exportCover(data), fonts: await exportFontFaces(data) }) };
+    }
+    const saved = await window.neo.exportSave(payload);
+    if (saved) toast(t('Exported: {file}', { file: saved.split('/').pop() }));
+  } catch (err) {
+    // An export that saves nothing must never be silent: name the failure,
+    // and put the stack in the error log for whatever bug report follows.
+    window.neo.logError('export ' + format + ': ' + (err && err.stack || err));
+    toast(t('Couldn’t export: {error}', { error: plainError(err) }), 8000);
+  }
 }
 
 function chooseEmailMethod() {
@@ -5509,7 +7726,7 @@ async function emailSettings() {
   if (addr === null) return false;
   if (addr) library.emailAddress = addr;
   library.emailMethod = await chooseEmailMethod();
-  await window.neo.writeLibrary(library);
+  await writeLibrary(library);
   toast(t('Email settings saved'));
   return true;
 }
@@ -5538,11 +7755,12 @@ async function doEmailDraft() {
       ? t('The PDF snapshot is in the Finder window NEO just opened — drag it into this email before sending.')
       : t('PDF snapshot attached.'));
   toast(t('Preparing your draft…'));
+  const snapshot = bookExportData();
   const res = await window.neo.emailDraft({
     to: library.emailAddress,
     subject,
     body,
-    html: buildHtml(null, { stamp: true }), // the email snapshot is a provenance record
+    html: buildHtml(snapshot, { stamp: true, fonts: await exportFontFaces(snapshot) }), // the email snapshot is a provenance record
     defaultName: safeName(book.title),
     method: library.emailMethod
   });
@@ -5628,12 +7846,36 @@ function updateDialogShow(state, info = {}) {
 async function checkForUpdate() {
   if (updateDialog) { updateDialog.focus(); return; }
   const res = await window.neo.checkForUpdate();
-  if (res.error) { toast(t('Couldn’t check for updates — try again later')); return; }
-  if (!res.hasUpdate) { toast(t('You’re on the latest version ({version})', { version: res.currentVersion })); return; }
+  // the answer comes in a window, like an update does: a line at the foot
+  // of the screen was too easy to miss
+  if (res.error) { updateNotice(t('Couldn’t check for updates — try again later')); return; }
+  if (!res.hasUpdate) { updateNotice(t('NEO is up to date'), t('You have {version}.', { version: res.currentVersion })); return; }
   updateDialog = updateDialogBox(res);
   if (!res.canInstall) updateDialogShow('release', res);
   else if (res.ready) updateDialogShow('ready', res);
   else updateDialogShow('offer', res);
+}
+
+function updateNotice(title, line) {
+  const bd = document.createElement('div');
+  bd.className = 'modal-backdrop';
+  bd.innerHTML = `
+    <div class="modal" style="width:400px" role="dialog" aria-modal="true">
+      <h2 style="font-size:16px"></h2>
+      <p class="up-text" hidden></p>
+      <div style="text-align:right;margin-top:14px"><button class="m-ok btn-gold">${t('OK')}</button></div>
+    </div>`;
+  bd.querySelector('h2').textContent = title;
+  if (line) { bd.querySelector('.up-text').hidden = false; bd.querySelector('.up-text').textContent = line; }
+  document.body.appendChild(bd);
+  const close = () => { bd.remove(); if (updateDialog === bd) updateDialog = null; };
+  bd.close = close;
+  bd.querySelector('.m-ok').onclick = close;
+  bd.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  updateDialog = bd; // asking again while it's open just brings it forward
+  bd.querySelector('.m-ok').focus();
 }
 
 // messages from the updater in the main process
@@ -5660,8 +7902,8 @@ async function showAbout() {
   bd.innerHTML = `
     <div class="modal" style="width:340px;text-align:center">
       <h2 style="font-size:22px;letter-spacing:6px">NEO</h2>
-      <p style="color:#999">${t('Version {version}', { version: v })}</p>
-      <p style="font-size:13px;color:#777">${t('A word processor for authors.')}</p>
+      <p class="about-version">${t('Version {version}', { version: v })}</p>
+      <p class="about-line">${t('A word processor for authors.')}</p>
       <div style="margin-top:16px">
         <button class="m-ok btn-gold">${t('Back to writing')}</button>
       </div>
@@ -5674,7 +7916,17 @@ async function showAbout() {
 }
 
 window.neo.onMenu(async (msg) => {
+  // full screen and focus mode together hide the bottom bar until hovered
+  // (styles.css); the window says when it goes in and out, whatever is open
+  if (msg.type === 'fullScreen') { document.body.classList.toggle('full-screen', !!msg.value); return; }
   if ($('#keyboard-shortcuts') && msg.type !== 'help') return;
+  // a window the menu opens (⌘, for Goals, say) never stacks on one that's
+  // already open: pressing it again used to pile up overlays
+  const WINDOWS = ['stats', 'about', 'emailSettings', 'coverArt', 'reshelve', 'checkUpdate'];
+  if (WINDOWS.includes(msg.type) && document.querySelector('.modal-backdrop:not([hidden])')) {
+    if (msg.type === 'checkUpdate' && updateDialog) updateDialog.focus();
+    return;
+  }
   if (msg.type === 'help') showHelp();
   if (msg.type === 'about') showAbout();
   if (msg.type === 'checkUpdate') checkForUpdate();
@@ -5682,7 +7934,7 @@ window.neo.onMenu(async (msg) => {
   if (msg.type === 'export') doExport(msg.format);
   if (msg.type === 'exportCustomChapterTitles') {
     library.exportCustomChapterTitles = msg.checked;
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
   }
   if (msg.type === 'emailDraft') doEmailDraft();
   if (msg.type === 'emailSettings') emailSettings();
@@ -5695,9 +7947,10 @@ window.neo.onMenu(async (msg) => {
   if (msg.type === 'focusCycle') cycleFocus();
   if (msg.type === 'import') importBooks();
   if (msg.type === 'stats') openStats();
+  if (msg.type === 'chapterStep') gotoChapter(msg.value);
   if (msg.type === 'writingStyle') {
     library.writingStyle = msg.value;
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     if (window.neo.writingStyleState) window.neo.writingStyleState(library.writingStyle);
   }
   if (msg.type === 'coverArt') openCoverArt();
@@ -5711,42 +7964,47 @@ window.neo.onMenu(async (msg) => {
     try { if (book && !$('#editor-view').hidden) sessionStorage.setItem('neo-reopen', book.id); } catch { /* a nicety */ }
     setTimeout(() => window.neo.reloadForLanguage(), 400);
   }
+  if (msg.type === 'uiZoom') {
+    library.uiZoom = msg.value;
+    await writeLibrary(library);
+    applyFonts();
+  }
   if (msg.type === 'uiBright') {
-    library.uiBright = !library.uiBright;
-    await window.neo.writeLibrary(library);
+    library.uiBright = !document.body.classList.contains('bright');
+    await writeLibrary(library);
     applyFonts();
   }
   if (msg.type === 'pageTheme') {
     library.pageTheme = msg.value;
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     applyFonts();
   }
   if (msg.type === 'fontSize') {
     const cur = library.editorFontSize || 17;
     library.editorFontSize = msg.value === 0 ? 17 : Math.min(22, Math.max(14, cur + msg.value));
     if (msg.value === 0) library.pageZoom = 1; // ⌘0 resets pinch zoom too
-    await window.neo.writeLibrary(library);
-    applyFonts();
+    await writeLibrary(library);
+    keepReadingPlace(applyFonts);
   }
   if (msg.type === 'bodyFontPick') {
     const name = await pickLocalFont();
     if (name) {
       library.fonts = library.fonts || {};
       library.fonts.body = name;
-      await window.neo.writeLibrary(library);
+      await writeLibrary(library);
     }
     applyFonts(); // also undoes a hover preview after Cancel
   }
   if (msg.type === 'bodyFont') {
     library.fonts = library.fonts || {};
     library.fonts.body = msg.value;
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     applyFonts();
   }
   if (msg.type === 'dropCap') {
     library.fonts = library.fonts || {};
     library.fonts.dropcap = msg.value;
-    await window.neo.writeLibrary(library);
+    await writeLibrary(library);
     applyFonts();
   }
 });
@@ -5779,7 +8037,8 @@ const LINUX_BODY_FONTS = {
   'TeX Gyre Pagella': '"TeX Gyre Pagella", Palatino, "Palatino Linotype", serif',
   'Libre Baskerville': '"Libre Baskerville", Baskerville, Georgia, serif',
   'Alegreya': '"Alegreya", "Hoefler Text", Georgia, serif',
-  'Source Serif Pro': '"Source Serif Pro", "Iowan Old Style", Georgia, serif'
+  'Source Serif Pro': '"Source Serif Pro", "Iowan Old Style", Georgia, serif',
+  'Jost': '"Jost", "Avenir Next", "Helvetica Neue", Arial, sans-serif'
 };
 
 function installLinuxBodyFonts() {
@@ -5810,6 +8069,190 @@ function installLinuxBodyFonts() {
   }
 }
 installLinuxBodyFonts();
+
+/* ================================================================== */
+/*  ACCESSIBILITY: keyboard, screen readers, system settings           */
+/* ================================================================== */
+// NEO stays quiet by design; these make the quiet parts reachable. The
+// system's own settings decide the rest: "Increase contrast" turns on the
+// Brighter Interface, "Reduce motion" stills the fades and slides.
+
+const SYSTEM_CONTRAST = window.matchMedia('(prefers-contrast: more)');
+const SYSTEM_STILL = window.matchMedia('(prefers-reduced-motion: reduce)');
+SYSTEM_CONTRAST.addEventListener('change', () => applyFonts());
+function scrollBehavior() { return SYSTEM_STILL.matches ? 'auto' : 'smooth'; }
+
+// Something clickable that isn't a <button>: Tab reaches it, Enter or Space
+// presses it, and a screen reader hears its name.
+function pressable(el, label) {
+  el.tabIndex = 0;
+  if (!el.getAttribute('role')) el.setAttribute('role', 'button');
+  if (label) el.setAttribute('aria-label', label);
+  el.addEventListener('keydown', (e) => {
+    if (e.target !== el || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); }
+  });
+}
+for (const id of ['#author-chip', '#goal-counter', '#word-counter', '#zoom-level']) pressable($(id));
+
+// The mouse leaves nothing focused in the quiet chrome, as before these were
+// focusable: after a click on a book, a chapter row, a tab, a counter or a
+// button there, the writer's next keys don't press it again, wake the bottom
+// bar or slide a pane open. (Text fields keep focus; they always show it.)
+document.addEventListener('mouseup', () => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el.matches(':focus-visible') || el.closest('.modal-backdrop')) return;
+  if (el.closest('#bottombar, #nav-pane, #side-pane, #shelf-header, #shelves')) el.blur();
+}, true);
+
+// the tabs: Enter or Space opens one, ← → move along the row
+$$('.tab').forEach((tab, i, all) => {
+  tab.addEventListener('keydown', (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); tab.click(); }
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      all[(i + (e.key === 'ArrowRight' ? 1 : all.length - 1)) % all.length].focus();
+    }
+  });
+});
+
+// Dialogs: announced as dialogs, keyboard focus moves inside (so Esc and
+// Enter reach them) and comes back to where it was when they close.
+let focusBeforeDialog = null;
+document.addEventListener('focusin', (e) => {
+  if (e.target.closest('.modal-backdrop')) return;
+  // only what the keyboard reached gets focus back when a dialog closes; after
+  // a click, the next Space the writer types must not press that control again
+  focusBeforeDialog = e.target.matches(':focus-visible') ? e.target : null;
+}, true);
+function dialogify(bd) {
+  const box = bd.querySelector('.modal');
+  if (!box || box.getAttribute('role')) return;
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  const h = box.querySelector('h2');
+  if (h) {
+    h.id = h.id || 'dlg-' + Math.random().toString(36).slice(2, 9);
+    box.setAttribute('aria-labelledby', h.id);
+  }
+  bd._returnFocus = focusBeforeDialog;
+  requestAnimationFrame(() => {
+    if (bd.hidden || bd.contains(document.activeElement)) return;
+    const first = box.querySelector('input:not([type=hidden]), select, textarea, .m-ok, button, [tabindex="0"]');
+    if (first) first.focus({ preventScroll: true });
+  });
+}
+new MutationObserver((muts) => {
+  for (const m of muts) {
+    m.addedNodes.forEach((n) => { if (n.nodeType === 1 && n.classList.contains('modal-backdrop')) dialogify(n); });
+    m.removedNodes.forEach((n) => {
+      const back = n._returnFocus;
+      if (!back || !back.isConnected || back.isContentEditable) return; // the page restores its own caret
+      if (document.activeElement && document.activeElement !== document.body) return;
+      back.focus({ preventScroll: true });
+    });
+  }
+}).observe(document.body, { childList: true });
+$$('.modal-backdrop').forEach(dialogify);
+
+// F6 walks the regions a mouse finds by hovering: the page, the chapters
+// pane, the notes pane, the bottom bar. ⇧F6 walks back; Esc returns to
+// the page from any of them. A pane opened this way closes when the
+// keyboard leaves it, unless it is pinned.
+let pagePlace = null; // where the caret was when the keyboard left the page
+$('#paper-scroll').addEventListener('focusout', (e) => {
+  if ($('#paper-scroll').contains(e.relatedTarget)) return;
+  const sel = window.getSelection();
+  if (sel.rangeCount && e.target.isContentEditable) pagePlace = { el: e.target, range: sel.getRangeAt(0).cloneRange() };
+});
+function focusPage() {
+  if (pagePlace && pagePlace.el.isConnected && !pagePlace.el.closest('[hidden]')) {
+    pagePlace.el.focus({ preventScroll: true });
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(pagePlace.range);
+    return;
+  }
+  if (currentTab === 'manuscript' && book && book.chapterOrder.length) {
+    focusChapter(currentChapterId || book.chapterOrder[0]);
+    return;
+  }
+  const aux = $('#aux-paper');
+  const target = aux.querySelector('[contenteditable="true"]:not([hidden] *), button');
+  if (target) target.focus();
+}
+function openPaneFromKeyboard(pane, first) {
+  if (!pane.classList.contains('open')) { pane.classList.add('open'); pane.dataset.kbd = '1'; }
+  if (first) first.focus();
+}
+for (const pane of [$('#nav-pane'), $('#side-pane')]) {
+  pane.addEventListener('focusout', (e) => {
+    if (pane.contains(e.relatedTarget) || pane.dataset.kbd !== '1') return;
+    // a list rebuilt under the keyboard hands focus straight back: wait a beat
+    setTimeout(() => {
+      if (pane.contains(document.activeElement) || pane.dataset.kbd !== '1') return;
+      pane.dataset.kbd = '0';
+      if (pane.dataset.pinned !== '1' && !chapterDragActive) pane.classList.remove('open');
+    }, 0);
+  });
+}
+const REGIONS = [
+  { box: () => $('#paper-scroll'), enter: focusPage },
+  {
+    box: () => $('#nav-pane'),
+    enter: () => {
+      const rows = $$('#nav-list .n-row');
+      const cur = $('#nav-list .nav-item.current .n-row');
+      openPaneFromKeyboard($('#nav-pane'), cur || rows[0] || $('#nav-add'));
+    }
+  },
+  {
+    box: () => $('#side-pane'),
+    enter: () => openPaneFromKeyboard($('#side-pane'), $('#sticky-list textarea') || $('#side-pin'))
+  },
+  { box: () => $('#bottombar'), enter: () => ($('.tab.active') || $('#back-to-shelf')).focus() }
+];
+// F6, or ⌃Tab: on a Mac the F-keys drive brightness and sound unless fn is
+// held, so F6 alone would do nothing there.
+const regionKey = (e) => e.key === 'F6' || (e.key === 'Tab' && e.ctrlKey && !e.metaKey && !e.altKey);
+// On the shelf: the books, then the header (author, Import, + Shelf).
+const SHELF_REGIONS = [
+  { box: () => $('#shelves'), enter: () => { const b = $('#shelves .book') || $('#shelves .new-book'); if (b) b.focus(); } },
+  { box: () => $('#shelf-header'), enter: () => $('#author-chip').focus() }
+];
+document.addEventListener('keydown', (e) => {
+  if (document.querySelector('.modal-backdrop:not([hidden])')) return;
+  if ($('#editor-view').hidden) {
+    if (!regionKey(e)) return;
+    e.preventDefault();
+    const at = SHELF_REGIONS.findIndex((r) => r.box().contains(document.activeElement));
+    SHELF_REGIONS[at < 0 ? 0 : (at + 1) % SHELF_REGIONS.length].enter();
+    return;
+  }
+  const here = REGIONS.findIndex((r) => r.box().contains(document.activeElement));
+  if (regionKey(e)) {
+    e.preventDefault();
+    // from nowhere in particular (a book just opened), forward starts at the page
+    if (here < 0) { REGIONS[e.shiftKey ? REGIONS.length - 1 : 0].enter(); return; }
+    REGIONS[(here + (e.shiftKey ? REGIONS.length - 1 : 1)) % REGIONS.length].enter();
+    return;
+  }
+  // Esc from a pane or the bottom bar: back to the words, not to the shelf
+  if (e.key === 'Escape' && !e.isComposing && here > 0 && $('#searchbar').hidden) {
+    e.preventDefault();
+    e.stopPropagation();
+    focusPage();
+  }
+}, true);
+// up and down the chapter list
+$('#nav-list').addEventListener('keydown', (e) => {
+  if (!e.target.classList.contains('n-row') || (e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
+  e.preventDefault();
+  const rows = $$('#nav-list .n-row');
+  const i = rows.indexOf(e.target) + (e.key === 'ArrowDown' ? 1 : -1);
+  if (rows[i]) rows[i].focus();
+});
 
 /* ================================================================== */
 

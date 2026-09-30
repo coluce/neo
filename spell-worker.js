@@ -8,10 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const nspell = require('nspell');
 const { spellPortuguese } = require('./spell-pt-br');
+const { prepareRomanianDictionary, normalizeRomanianWord } = require('./spell-ro');
 
 let spell = null;
 let ptBrDictionaryPath = null;
 let learnedWords = new Set();
+let normalizeWord = (word) => word;
 
 function reply(msg, extra) {
   process.parentPort.postMessage({ id: msg.id, ...extra });
@@ -34,9 +36,16 @@ async function handleMessage(msg) {
         aff: fs.readFileSync(path.join(msg.dir, 'index.aff')),
         dic: fs.readFileSync(path.join(msg.dir, 'index.dic'))
       };
-      const next = nspell(dict);
+      const romanian = msg.language === 'ro';
+      const normalize = romanian ? normalizeRomanianWord : (word) => word;
+      const next = nspell(romanian ? prepareRomanianDictionary(dict) : dict);
+      for (const w of msg.custom || []) next.add(normalize(w));
       for (const w of learnedWords) next.add(w);
       spell = next;
+      normalizeWord = normalize;
+      reply(msg, { ok: true });
+      spell = next;
+      normalizeWord = normalize;
       reply(msg, { ok: true });
     } else if (msg.type === 'check') {
       const out = {};
@@ -48,7 +57,7 @@ async function handleMessage(msg) {
         return;
       }
       // dictionary still loading: report everything correct rather than crying wolf
-      for (const w of msg.words || []) out[w] = spell ? spell.correct(w) : true;
+      for (const w of msg.words || []) out[w] = spell ? spell.correct(normalizeWord(w)) : true;
       reply(msg, { ok: true, result: out });
     } else if (msg.type === 'suggest') {
       if (ptBrDictionaryPath) {
@@ -56,10 +65,10 @@ async function handleMessage(msg) {
         reply(msg, { ok: true, result: issues[0] ? (issues[0].suggestions || []).slice(0, 6) : [] });
         return;
       }
-      reply(msg, { ok: true, result: spell ? spell.suggest(msg.word).slice(0, 6) : [] });
+      reply(msg, { ok: true, result: spell ? spell.suggest(normalizeWord(msg.word)).slice(0, 6) : [] });
     } else if (msg.type === 'add') {
-      if (typeof msg.word === 'string') learnedWords.add(msg.word.toLowerCase());
-      if (spell && typeof msg.word === 'string') spell.add(msg.word);
+      if (typeof msg.word === 'string') learnedWords.add(String(msg.word).toLowerCase());
+      if (spell && typeof msg.word === 'string') spell.add(normalizeWord(msg.word));
       reply(msg, { ok: true });
     } else {
       reply(msg, { ok: false, error: 'unknown message' });
