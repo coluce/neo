@@ -1,0 +1,10 @@
+VERO - Verificador Ortográfico Livre, version 2.1.4
+Copyright (C) 2006-2013 Raimundo Santos Moura
+Brazil, October 2013
+
+The Brazilian Portuguese spelling dictionary data is licensed under the
+GNU Lesser General Public License version 3 (LGPLv3) and the Mozilla Public
+License (MPL), as stated in the original Hunspell dictionary files.
+
+The original VERO Hunspell source files (pt_BR.aff and pt_BR.dic) were used
+to generate pt_BR.trie.gz. They are not included in this repository.
