@@ -17,11 +17,11 @@ NEO currently speaks:
 | `ro` | Română | complete, machine-assisted: native review welcome |
 | `ru` | Русский | complete, reviewed by a native speaker |
 
-Spellchecking (Edit → Spellcheck Language) covers English, French, Spanish, German, Dutch, Polish, Romanian and Russian. Italian is left out because the only Hunspell dictionary on npm is GPL-3.0-only, which does not sit well in an MIT app; Portuguese because its dictionary takes minutes to load with nspell.
+Spellchecking (Edit → Spellcheck Language) covers English, French, Spanish, German, Dutch, Polish, Brazilian Portuguese, Romanian and Russian. The engine is Hunspell itself, compiled to WebAssembly, so every dictionary loads in well under a second. Italian is left out because the only Hunspell dictionary on npm is GPL-3.0-only, which does not sit well in an MIT app. The Brazilian Portuguese interface starts with the Brazilian dictionary; the European Portuguese interface leaves the choice to the writer, since spellings differ.
 
 Spellcheck starts off on every launch. Choosing a dictionary does not turn it on. If the interface starts in Romanian and the library has no saved spellcheck language, NEO selects and saves Romanian. Explicit dictionary choices survive interface-language changes. Other interface languages keep their existing defaults.
 
-Romanian lookup accepts standard diacritics, legacy `ş/ţ`, and decomposed Unicode accents without changing manuscript text. Suggestions use standard Romanian spelling. This checks spelling, not grammar: both `sa` and `să` are words. See [the dictionary evaluation](scripts/romanian-spellcheck.md) for performance, nspell compatibility, and licensing details.
+Romanian lookup accepts standard diacritics, legacy `ş/ţ`, and decomposed Unicode accents without changing manuscript text. Suggestions use standard Romanian spelling. This checks spelling, not grammar: both `sa` and `să` are words. See [the Romanian evaluation](scripts/romanian-spellcheck.md) and [the Portuguese evaluation](scripts/portuguese-spellcheck.md) for performance and licensing details.
 
 If you speak one of these and something reads oddly, a pull request that fixes a line is the most welcome contribution there is.
 

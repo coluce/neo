@@ -153,5 +153,10 @@
   "Chapter Titles Only": "Apenas títulos dos capítulos",
   "Chapters are numbered straight through": "Os capítulos são numerados seguidos",
   "Off → paragraph → sentence → off.": "Desligado → parágrafo → frase → desligado.",
-  "Outline note": "Nota do esquema"
+  "Outline note": "Nota do esquema",
+  "Vim keys on — Esc to move, i to write": "Teclas do Vim ligadas — Esc para se deslocar, i para escrever",
+  "Stop writing and move around the page": "Parar de escrever e deslocar-se pela página",
+  "Down or up half a screen": "Meio ecrã para baixo ou para cima",
+  "Write in a new paragraph below or above": "Escrever num novo parágrafo abaixo ou acima",
+  "Move to stretch it, then y to copy or d to cut.": "Desloque-se para a alargar; depois y para copiar ou d para cortar."
 }

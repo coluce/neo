@@ -103,3 +103,28 @@ body.light .book { box-shadow: 2px 3px 6px rgba(0,0,0,0.2); }
    stays faintly there, and small (not a 40px tap target) */
 .nav-gap .ng-plus { opacity: 0.45; pointer-events: auto; min-height: 0; width: 26px; height: 26px; margin: -13px 0 0 -13px; line-height: 23px; }
 .nav-gap::before { display: none; }
+
+/* The Chapters pane is for hopping on Pocket: a chapter's note shows but
+   isn't written here (the Outline is where it's written), and an empty one
+   takes no room */
+.nav-note.nav-note-ro:empty { display: none; }
+/* …and no + seams between the boxes: chapters are added from the
+   + Chapter button at the bottom, or with Enter three times */
+#nav-list .nav-gap { display: none; }
+
+/* Undo / redo, above the on-screen keyboard while it's up (a physical
+   keyboard has ⌘Z / Ctrl+Z) — see index.html */
+#pocket-undo {
+  position: fixed; right: 12px; bottom: calc(62px + var(--kb)); z-index: 85;
+  display: flex; gap: 2px; padding: 2px;
+  background: #242424; border: 1px solid #333; border-radius: 22px;
+}
+#pocket-undo[hidden] { display: none; }
+#pocket-undo button {
+  background: none; border: none; color: #d6d2c6; width: 44px; height: 40px;
+  display: flex; align-items: center; justify-content: center; padding: 0;
+}
+#pocket-undo button:disabled { color: #5e5b55; }
+body.light #pocket-undo { background: #f1eee8; border-color: #dcd7ce; }
+body.light #pocket-undo button { color: #2b2926; }
+body.light #pocket-undo button:disabled { color: #b0aa9f; }

@@ -26,14 +26,12 @@ https://registry.npmjs.org/dictionary-ro/-/dictionary-ro-3.0.0.tgz
 Package project: https://github.com/wooorm/dictionaries/tree/main/dictionaries/ro
 Dictionary project: https://rospell.wordpress.com/
 
-Compatibility conversion, added 2026-09-28
+Lookup, updated 2026-09-30
 
-NEO's spell-ro.js renames shared prefix flags and expands the corresponding
-dictionary flags in memory for nspell 2.1.5. This preserves both prefix and
-suffix rules. The files shipped on disk are unchanged. The conversion's
-source is included in app.asar as spell-ro.js and in NEO's source repository:
-https://github.com/hughhowey/neo
-Lookup also normalizes Romanian diacritics without altering manuscript text.
+Since NEO 1.2, Hunspell reads index.aff and index.dic exactly as
+distributed; no conversion is applied. Lookup normalizes Romanian
+diacritics (spell-ro.js, in app.asar and in NEO's source repository,
+https://github.com/hughhowey/neo) without altering manuscript text.
 
 MPL 1.1 Exhibit A notice for the dictionary data
 

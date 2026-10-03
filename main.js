@@ -7,6 +7,20 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// Every disk request from the page passes through here: a write the system
+// refuses (see reportBlockedWrite) is explained to the writer, then the error
+// goes back to the page as before.
+{
+  const handle = ipcMain.handle.bind(ipcMain);
+  ipcMain.handle = (channel, fn) => handle(channel, (...args) => {
+    // a handler's answer keeps its own timing: sync stays sync
+    let out;
+    try { out = fn(...args); } catch (err) { reportBlockedWrite(err); throw err; }
+    if (out && typeof out.then === 'function') out.catch((err) => reportBlockedWrite(err));
+    return out;
+  });
+}
+
 // macOS Chromium's "smart delete" also removes whitespace around a deleted
 // selection, and that pass can duplicate characters. Deletes stay literal.
 app.commandLine.appendSwitch('blink-settings', 'smartInsertDeleteEnabled=false');
@@ -168,6 +182,79 @@ async function chooseLibraryFolder() {
   app.exit(0);
 }
 
+// Can NEO write in this folder? Windows' Controlled folder access (Defender's
+// ransomware protection) refuses new files in Documents to apps it doesn't
+// know, and NEO is one. A small file written and removed tells.
+function folderWritable(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, '.neo-write-test');
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+    return true;
+  } catch (err) {
+    logError('library folder not writable: ' + dir, err);
+    return false;
+  }
+}
+const isBlockedWrite = (err) => !!err && ['EPERM', 'EACCES', 'EROFS'].includes(err.code);
+function blockedDetail(dir) {
+  return t('Your books can\'t be saved in:\n{dir}', { dir }) + '\n\n' + (process.platform === 'win32'
+    ? t('This is usually Windows Security\'s Controlled folder access (Virus & threat protection → Ransomware protection). Allow NEO there, or keep your library in another folder.')
+    : t('Check that the folder exists and that NEO may write to it, or keep your library in another folder.'));
+}
+// At startup, before any window: a library that can't be written is said
+// plainly, once, with a way out — not a hiccup at "Start writing"
+function checkLibraryWritable() {
+  // (only where it can happen: on Windows, and anywhere before a first
+  // library exists; a synced library elsewhere isn't sent a test file
+  // every launch)
+  if (process.platform !== 'win32' && fs.existsSync(LIBRARY_FILE)) return;
+  while (!folderWritable(LIBRARY_DIR)) {
+    const r = dialog.showMessageBoxSync({
+      type: 'warning',
+      message: t('NEO can\'t save in your library folder'),
+      detail: blockedDetail(LIBRARY_DIR),
+      buttons: [t('Choose Folder…'), t('Try Again'), t('Continue')],
+      defaultId: 0,
+      cancelId: 2
+    });
+    if (r === 2) return;
+    if (r === 0) {
+      const picked = dialog.showOpenDialogSync({
+        title: t('Choose a folder for your NEO library'),
+        defaultPath: os.homedir(),
+        properties: ['openDirectory', 'createDirectory']
+      });
+      if (!picked || !picked[0]) continue;
+      LIBRARY_DIR = picked[0];
+      LIBRARY_FILE = path.join(LIBRARY_DIR, 'library.json');
+      const settings = readSettings();
+      settings.libraryDir = LIBRARY_DIR;
+      try { writeSettings(settings); } catch (err) { logError('settings', err); }
+    }
+  }
+}
+// Later on (the protection switched on mid-session), a refused save says so
+// once. The words stay on the page; NEO saves them as soon as it may.
+let blockedShown = false;
+function reportBlockedWrite(err) {
+  if (blockedShown || !isBlockedWrite(err)) return;
+  // the library's own files only (an export to a protected folder is the
+  // export's business)
+  const rel = err.path ? path.relative(LIBRARY_DIR, err.path) : '..';
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return;
+  blockedShown = true;
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const opts = {
+    type: 'warning',
+    message: t('NEO can\'t save in your library folder'),
+    detail: blockedDetail(LIBRARY_DIR) + '\n\n' + t('Your words stay on the page until it can.'),
+    buttons: [t('OK')]
+  };
+  (win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)).catch(() => {});
+}
+
 function ensureLibrary() {
   if (!fs.existsSync(LIBRARY_DIR)) fs.mkdirSync(LIBRARY_DIR, { recursive: true });
   if (!fs.existsSync(LIBRARY_FILE)) {
@@ -224,18 +311,81 @@ function writeCatalog() {
   }
 }
 
-function readJSON(file, fallback) {
+// Writing that survives the power going out. A new file is written beside
+// the old one, pushed all the way to the disk (fsync), and only then swapped
+// in. Without the push, a power cut right after the swap can leave the swap
+// done and the words not: an empty book.json, and the book gone from its
+// shelf (#219). A missing file or an unlucky moment never costs more than
+// the last few seconds.
+function writeFileDurable(file, data) {
+  const tmp = file + '.tmp';
+  const fd = fs.openSync(tmp, 'w');
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
+    fs.writeSync(fd, typeof data === 'string' ? data : Buffer.from(data));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+  // the swap itself, on systems that let a folder be pushed too
+  if (process.platform !== 'win32') {
+    try { const d = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } } catch { /* fine */ }
   }
 }
 
+// JSON reads fall back on the copies a write leaves: the .tmp a write was
+// making when it stopped, then .bak, the last version that read whole. What
+// they recover is put back as the file itself.
+function parseJSONFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return undefined; }
+}
+function readJSON(file, fallback) {
+  const main = parseJSONFile(file);
+  if (main !== undefined) return main;
+  if (!fs.existsSync(file) && !fs.existsSync(file + '.bak')) return fallback;
+  for (const spare of [file + '.tmp', file + '.bak']) {
+    const v = parseJSONFile(spare);
+    if (v === undefined) continue;
+    logError('recovered', `${file} was unreadable; restored from ${path.basename(spare)}`);
+    try { writeFileDurable(file, JSON.stringify(v, null, 2)); } catch (err) { logError('recover write', err); }
+    return v;
+  }
+  return fallback;
+}
+
 function writeJSON(file, data) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file); // atomic-ish: never leave a half-written file
+  // the version on disk, while it reads whole, becomes the .bak
+  if (parseJSONFile(file) !== undefined) {
+    try { fs.copyFileSync(file, file + '.bak'); } catch { /* the write still goes ahead */ }
+  }
+  writeFileDurable(file, JSON.stringify(data, null, 2));
+}
+
+// A book whose book.json is gone for good (and no .bak) still has its
+// chapters: the book comes back with them in the order they were made, its
+// title from the catalog, rather than vanishing from the shelf.
+function rebuildBookMeta(bookId) {
+  const dir = bookDir(bookId);
+  const chDir = path.join(dir, 'chapters');
+  if (!fs.existsSync(chDir)) return null;
+  let title = '';
+  try {
+    const cat = fs.readFileSync(path.join(LIBRARY_DIR, '_catalog.txt'), 'utf8');
+    const line = cat.split('\n').find((l) => l.includes('  —  ' + bookId + '  —  '));
+    if (line) title = line.split('  —  ')[0].trim();
+  } catch { /* no catalog */ }
+  const order = fs.readdirSync(chDir).filter((f) => f.endsWith('.html')).map((f) => f.slice(0, -5)).sort();
+  const meta = {
+    id: bookId,
+    title: title || t('Untitled'),
+    subtitle: '', series: '', author: t('Anonymous'), wordGoal: 0,
+    created: new Date().toISOString(), modified: new Date().toISOString(),
+    chapterOrder: order,
+    tabNames: { notes: 'Notes', outline: 'Outline' }
+  };
+  logError('recovered', `${bookId}/book.json was lost; rebuilt from ${order.length} chapter files`);
+  try { writeJSON(path.join(dir, 'book.json'), meta); } catch (err) { logError('recover write', err); }
+  return meta;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +394,21 @@ function writeJSON(file, data) {
 
 ipcMain.handle('library:read', () => {
   ensureLibrary();
-  return readJSON(LIBRARY_FILE, null);
+  const lib = readJSON(LIBRARY_FILE, null);
+  if (lib) return lib;
+  // library.json lost with no copy to fall back on: every book in the
+  // folder goes onto one shelf, so nothing disappears
+  const ids = [];
+  try {
+    for (const d of fs.readdirSync(LIBRARY_DIR)) {
+      if (d.startsWith('book-') && fs.existsSync(path.join(LIBRARY_DIR, d, 'chapters'))) ids.push(d);
+    }
+  } catch { /* empty */ }
+  const seed = { authorName: '', penNames: [], firstRunDone: ids.length > 0, pageTheme: 'night',
+    shelves: [{ id: 'shelf-1', name: t('Works in Progress'), bookIds: ids }] };
+  logError('recovered', `library.json was lost; ${ids.length} books put back on one shelf`);
+  try { writeJSON(LIBRARY_FILE, seed); } catch (err) { logError('recover write', err); }
+  return seed;
 });
 
 ipcMain.handle('library:write', (_e, data) => {
@@ -258,8 +422,9 @@ ipcMain.handle('library:write', (_e, data) => {
 ipcMain.handle('book:create', (_e, meta) => {
   ensureLibrary();
   // folders carry a slug of the title when it's known at creation (imports),
-  // so the library reads like a bookshelf in Finder too
-  const slug = String(meta.title || '').toLowerCase()
+  // so the library reads like a bookshelf in Finder too. Accents come off
+  // first, so "Capítulo" reads "capitulo", not "cap-tulo"
+  const slug = String(meta.title || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30);
   const id = 'book-' + (slug ? slug + '-' : '') +
     Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
@@ -299,7 +464,7 @@ ipcMain.handle('library:listBooks', () => {
 });
 
 ipcMain.handle('book:readMeta', (_e, bookId) => {
-  return readJSON(path.join(bookDir(bookId), 'book.json'), null);
+  return readJSON(path.join(bookDir(bookId), 'book.json'), null) || rebuildBookMeta(bookId);
 });
 
 ipcMain.handle('book:writeMeta', (_e, bookId, meta) => {
@@ -341,7 +506,7 @@ ipcMain.handle('chapter:write', (_e, bookId, chapterId, html) => {
   const dir = path.join(bookDir(bookId), 'chapters');
   const file = path.join(dir, libName(chapterId) + '.html');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(file, html);
+  writeFileDurable(file, html);
   return true;
 });
 
@@ -362,7 +527,7 @@ ipcMain.handle('aux:read', (_e, bookId, name) => {
 });
 
 ipcMain.handle('aux:write', (_e, bookId, name, html) => {
-  fs.writeFileSync(path.join(bookDir(bookId), libName(name) + '.html'), html);
+  writeFileDurable(path.join(bookDir(bookId), libName(name) + '.html'), html);
   return true;
 });
 
@@ -677,7 +842,7 @@ async function buildZip(zipEntries) {
   });
 }
 
-ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntries }) => {
+ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntries, base64 }) => {
   const win = BrowserWindow.getFocusedWindow();
   const { canceled, filePath } = await dialog.showSaveDialog(win, {
     defaultPath: path.join(os.homedir(), 'Documents', defaultName + '.' + format),
@@ -687,6 +852,9 @@ ipcMain.handle('export:save', async (_e, { format, defaultName, content, zipEntr
   try {
     if (zipEntries) {
       fs.writeFileSync(filePath, await buildZip(zipEntries));
+    } else if (base64) {
+      // pictures (a saved cover) arrive as base64
+      fs.writeFileSync(filePath, Buffer.from(content, 'base64'));
     } else if (format === 'pdf') {
       fs.writeFileSync(filePath, await renderPDF(content));
     } else {
@@ -847,7 +1015,10 @@ const CHAPTER_WORDS = new RegExp('^(' + [
   // ro (prolog, epilog above). A bare "Capitol" only before a number:
   // on its own it is an English word, and "Capitol Hill was quiet." is prose
   'capitol(?=\\s+\\d)', 'capitolul', 'partea',
-  'глава', 'пролог', 'эпилог', 'часть'                             // ru
+  'глава', 'пролог', 'эпилог', 'часть',                            // ru
+  'κεφάλαιο', 'κεφαλαιο', 'πρόλογος', 'προλογος',
+  'επίλογος', 'επιλογος', 'μέρος', 'μερος',
+  'ραψωδία', 'ραψωδια'                                              // el
 ].join('|') + ')(?![\\p{L}\\d])', 'iu');
 
 // A manuscript's own Prologue / Epilogue headings give those chapters their role
@@ -1055,11 +1226,15 @@ ipcMain.handle('import:pick', async () => {
 const ERROR_LOG = () => path.join(LIBRARY_DIR, 'neo-errors.log');
 
 function logError(source, err) {
+  const line = `[${new Date().toISOString()}] [${source}] ${err && err.stack ? err.stack : String(err)}\n`;
   try {
     ensureLibrary();
-    const line = `[${new Date().toISOString()}] [${source}] ${err && err.stack ? err.stack : String(err)}\n`;
     fs.appendFileSync(ERROR_LOG(), line);
-  } catch { /* never let logging crash the app */ }
+  } catch {
+    // the library can't be written (the very case worth logging): NEO's own
+    // app folder takes the line instead
+    try { fs.appendFileSync(path.join(app.getPath('userData'), 'neo-errors.log'), line); } catch { /* never let logging crash the app */ }
+  }
 }
 
 process.on('uncaughtException', (err) => logError('main', err));
@@ -1143,9 +1318,13 @@ function createWindow() {
   }
   const win = new BrowserWindow({
     ...bounds,
-    minWidth: 800,
+    minWidth: 700,
     minHeight: 600,
-    titleBarStyle: 'hiddenInset',
+    // the Mac's inset traffic lights. Only there: on Linux any title bar
+    // style but the default leaves the window frameless, and on Wayland the
+    // menu bar lives in that frame (KDE Plasma showed no menu, and Alt
+    // found nothing to show)
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : {}),
     backgroundColor: roomColor(libraryPageTheme()),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -1167,7 +1346,11 @@ function createWindow() {
     if (win.isDestroyed()) return;
     win.webContents.send('menu', { type: 'fullScreen', value: full }); // the page's bottom bar too
     if (process.platform === 'darwin') return;
-    win.setMenuBarVisibility(!full && !win.isMenuBarAutoHide());
+    // full screen hides the bar until Alt brings it up (and it tucks away
+    // again after a choice), the way Windows apps do; out of full screen
+    // it's always there
+    win.setAutoHideMenuBar(full);
+    win.setMenuBarVisibility(!full);
   });
   win.on('enter-full-screen', () => fullScreenChanged(true));
   win.on('leave-full-screen', () => fullScreenChanged(false));
@@ -1180,11 +1363,12 @@ function createWindow() {
   win.on('move', remember);
   win.on('close', remember);
 
-  // Right-click on text: Cut, Copy, Paste, Select All. On a Mac, macOS adds
-  // Look Up, Writing Tools and Services on its own when the menu knows where
-  // the selection sits (the frame). NEO's own right-click menus (shelves,
-  // covers, chapter headings, flagged words) cancel the event first, so this
-  // never comes up over them.
+  // Right-click on text: Cut, Copy, Paste, Select All — and nothing else.
+  // Handing macOS the frame (where the selection sits) is what invites it to
+  // add Writing Tools, and NEO carries no generative-AI tools, ever, so the
+  // frame stays out. NEO's own right-click menus (shelves, covers, chapter
+  // headings, flagged words) cancel the event first, so this never comes up
+  // over them.
   win.webContents.on('context-menu', (_e, params) => {
     if (!params.isEditable && !params.selectionText) return;
     const can = params.editFlags || {};
@@ -1193,7 +1377,7 @@ function createWindow() {
     items.push({ role: 'copy', label: t('Copy'), enabled: !!can.canCopy });
     if (params.isEditable) items.push({ role: 'paste', label: t('Paste'), enabled: !!can.canPaste });
     items.push({ type: 'separator' }, { role: 'selectAll', label: t('Select All') });
-    Menu.buildFromTemplate(items).popup({ window: win, frame: params.frame });
+    Menu.buildFromTemplate(items).popup({ window: win });
   });
 
   // NEO does its own spellchecking (see spell:* handlers) — the engine's
@@ -1202,7 +1386,8 @@ function createWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// Spellcheck: NEO's own bundled Hunspell dictionaries via nspell, identical
+// Spellcheck: NEO's own bundled Hunspell dictionaries, checked by Hunspell
+// itself (WebAssembly, in spell-worker.js), identical
 // on every platform. The renderer paints the squiggles and asks for
 // suggestions. Edit → Spellcheck Language picks the dictionary; the choice
 // lives in library.json so it travels with the writer's books.
@@ -1221,11 +1406,12 @@ const SPELL_LANGUAGES = {
   'pl': { label: 'Polski', pkg: 'dictionary-pl' },
   'pt-BR': { label: 'Português (Brasil)', trie: path.join(__dirname, 'dict', 'pt_BR.trie.gz') },
   'ro': { label: 'Română', pkg: 'dictionary-ro' },
-  'ru': { label: 'Русский', pkg: 'dictionary-ru' }
+  'ru': { label: 'Русский', pkg: 'dictionary-ru' },
+  'el': { label: 'Ελληνικά', pkg: 'dictionary-el' }
 };
 
-// The dictionary work runs in a helper process (spell-worker.js): parsing
-// French takes seconds, and the writing room must never wait for it.
+// The dictionary work runs in a helper process (spell-worker.js), so the
+// writing room never waits for a dictionary to load.
 let spellChild = null;
 let spellSeq = 0;
 const spellWaiting = new Map();
@@ -1289,6 +1475,9 @@ function chosenSpellLanguage() {
 function defaultSpellLanguage() {
   const ui = String(uiLanguage || 'en');
   if (SPELL_LANGUAGES[ui]) return ui;
+  // NEO's Portuguese interface is Brazilian; the dictionary is too. The
+  // European interface (pt-PT) leaves the choice to the writer.
+  if (ui === 'pt' || ui === 'pt-BR') return 'pt-BR';
   const base = ui.split('-')[0];
   return SPELL_LANGUAGES[base] ? base : 'en-US';
 }
@@ -1335,6 +1524,7 @@ function sendToWindow(msg) {
 // the Format menu's ticks: whether the caret is in a poetry paragraph, and
 // whether typewriter scrolling is on
 let poetryState = false;
+let flushState = false;
 let typewriterState = false;
 ipcMain.on('poetry:state', (_e, on) => {
   on = !!on;
@@ -1342,10 +1532,24 @@ ipcMain.on('poetry:state', (_e, on) => {
   poetryState = on;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
+ipcMain.on('flush:state', (_e, on) => {
+  on = !!on;
+  if (on === flushState) return;
+  flushState = on;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
 ipcMain.on('typewriter:state', (_e, on) => {
   on = !!on;
   if (on === typewriterState) return;
   typewriterState = on;
+  try { buildMenu(); } catch (err) { logError('menu', err); }
+});
+// View → Vim Keys shows whether they're on
+let vimState = false;
+ipcMain.on('vim:state', (_e, on) => {
+  on = !!on;
+  if (on === vimState) return;
+  vimState = on;
   try { buildMenu(); } catch (err) { logError('menu', err); }
 });
 // View → Interface Size shows its choice
@@ -1385,10 +1589,10 @@ function buildMenu() {
   // them, so the menu names the faces bundled in fonts/ (see styles.css).
   // The Windows list stays the one the renderer already understands.
   const bodyFonts = isMac
-    ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost']
+    ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost', 'iA Writer Quattro']
     : isWin
-      ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost']
-      : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro', 'Jost'];
+      ? ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost', 'iA Writer Quattro']
+      : ['Gelasio', 'TeX Gyre Pagella', 'Libre Baskerville', 'Alegreya', 'Source Serif Pro', 'Jost', 'iA Writer Quattro'];
   const template = [
     // appMenu exists only on macOS — including it on Windows throws,
     // which is exactly what kept NEO from ever opening a window there
@@ -1461,6 +1665,8 @@ function buildMenu() {
       ]
     },
     {
+      // macOS slips Writing Tools and AutoFill into this menu on its own;
+      // hideSystemEditItems() hides them again (see below)
       label: t('Edit'),
       submenu: [
         // standard items carry their own labels, so they follow NEO's language
@@ -1536,13 +1742,29 @@ function buildMenu() {
           click: () => sendToWindow({ type: 'typewriter' })
         },
         { type: 'separator' },
-        // ticks when the caret sits in a poetry paragraph; ⇧Enter is the
-        // editor's own key, so no accelerator here
+        // tick when the caret sits in one; the keys are the editor's own
+        // (they split or continue a paragraph, which a menu item can't), so
+        // they're named here without an accelerator
         {
-          label: t('Poetry Paragraph') + '\t⇧Enter',
+          label: t('Flush Paragraph') + '\t' + (isMac ? '⇧Enter' : 'Shift+Enter'),
+          type: 'checkbox',
+          checked: flushState,
+          click: () => sendToWindow({ type: 'flush' })
+        },
+        {
+          label: t('Poetry Paragraph') + '\t' + (isMac ? '⇧⌘Enter' : 'Ctrl+Shift+Enter'),
           type: 'checkbox',
           checked: poetryState,
           click: () => sendToWindow({ type: 'poetry' })
+        },
+        { type: 'separator' },
+        // *italic* and **bold** as you type or paste; off for writers who
+        // keep literal asterisks
+        {
+          label: t('Markdown Emphasis'),
+          type: 'checkbox',
+          checked: !readJSON(LIBRARY_FILE, {}).markdownOff,
+          click: (item) => sendToWindow({ type: 'markdownEmphasis', checked: item.checked })
         }
       ]
     },
@@ -1573,10 +1795,12 @@ function buildMenu() {
             { label: t('Off'), type: 'radio', checked: viewState.focus === 'off', click: () => sendToWindow({ type: 'focus', value: 'off' }) }
           ]
         },
-        { type: 'separator' },
-        // the next or previous chapter, without opening the pane
-        { label: t('Next Chapter'), accelerator: 'Alt+CmdOrCtrl+Down', click: () => sendToWindow({ type: 'chapterStep', value: 1 }) },
-        { label: t('Previous Chapter'), accelerator: 'Alt+CmdOrCtrl+Up', click: () => sendToWindow({ type: 'chapterStep', value: -1 }) },
+        {
+          label: t('Vim Keys'),
+          type: 'checkbox',
+          checked: vimState,
+          click: () => sendToWindow({ type: 'vim' })
+        },
         { type: 'separator' },
         {
           label: t('Page'),
@@ -1645,7 +1869,156 @@ function buildMenu() {
       ]
     }
   ];
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+  const menu = Menu.buildFromTemplate(template);
+  editMenuState.edit = null; // the old menu bar is going: forget its Edit menu first
+  Menu.setApplicationMenu(menu);
+  if (isMac) {
+    // macOS adds its items as the menu opens: NEO hears each addition
+    // (watchEditMenu) and looks again whenever the menu opens
+    const edit = menu.items.find((it) => it.submenu && it.label === t('Edit'));
+    if (edit) {
+      // NEO's own Edit items in order; null stands for a separator
+      editMenuState.index = menu.items.indexOf(edit);
+      editMenuState.ours = edit.submenu.items.map((it) => (it.type === 'separator' ? null : menuTitle(it.label)));
+      watchEditMenu();
+      setImmediate(hideSystemEditItems);
+      edit.submenu.on('menu-will-show', hideSystemEditItems);
+    }
+  }
+}
+
+// No generative-AI tools in NEO — not now, not later.
+//
+// macOS inserts "Writing Tools" (Apple Intelligence) and "AutoFill" into
+// any app's Edit menu while the menu is opening, and Electron has no
+// switch for either. Deleting them doesn't last (macOS puts them back);
+// hiding them does. NEO reaches the real menu through the Objective-C
+// runtime (koffi, a small FFI library) and listens for the notice AppKit
+// sends whenever an item is added to or changed in a menu. The moment
+// anything lands in the Edit menu, NEO walks the menu alongside the one it
+// built and hides every item that isn't its own, in any language. Should
+// anything here fail, the menu is left as macOS made it: this never stops
+// NEO from working.
+let objc = null;
+function objcRuntime() {
+  if (objc) return objc;
+  const koffi = require('koffi');
+  const lib = koffi.load('/usr/lib/libobjc.A.dylib');
+  const NoteIMP = koffi.proto('void NoteIMP(void *self, void *cmd, void *note)');
+  objc = {
+    koffi,
+    NoteIMP,
+    cls: lib.func('void *objc_getClass(const char *name)'),
+    sel: lib.func('void *sel_registerName(const char *name)'),
+    allocClass: lib.func('void *objc_allocateClassPair(void *superclass, const char *name, size_t extra)'),
+    registerClass: lib.func('void objc_registerClassPair(void *cls)'),
+    addMethod: lib.func('bool class_addMethod(void *cls, void *name, NoteIMP *imp, const char *types)'),
+    // objc_msgSend, typed once per shape it is called with
+    obj: lib.func('objc_msgSend', 'void *', ['void *', 'void *']),
+    objAt: lib.func('objc_msgSend', 'void *', ['void *', 'void *', 'long']),
+    objStr: lib.func('objc_msgSend', 'void *', ['void *', 'void *', 'const char *']),
+    count: lib.func('objc_msgSend', 'long', ['void *', 'void *']),
+    flag: lib.func('objc_msgSend', 'bool', ['void *', 'void *']),
+    str: lib.func('objc_msgSend', 'const char *', ['void *', 'void *']),
+    setFlag: lib.func('objc_msgSend', 'void', ['void *', 'void *', 'bool']),
+    selName: lib.func('const char *sel_getName(void *sel)'),
+    actionOf: lib.func('objc_msgSend', 'void *', ['void *', 'void *']),
+    observe: lib.func('objc_msgSend', 'void', ['void *', 'void *', 'void *', 'void *', 'void *', 'void *'])
+  };
+  return objc;
+}
+const editMenuState = { index: -1, ours: [], edit: null, watching: false, hiding: false };
+// macOS drops the & that Electron reads as a keyboard mnemonic ("Find & Replace"
+// arrives as "Find  Replace"), so titles are compared without it
+const menuTitle = (s) => String(s || '').replace(/&/g, '').replace(/\s+/g, ' ').trim();
+// the actions Electron gives the items it builds: never macOS's own
+const ELECTRON_ACTIONS = new Set(['itemSelected:', 'undo:', 'redo:', 'cut:', 'copy:', 'paste:', 'pasteAndMatchStyle:', 'selectAll:']);
+const addr = (p) => (p ? objc.koffi.address(p) : 0n);
+// the Edit menu as AppKit holds it right now
+function nativeEditMenu() {
+  const o = objcRuntime();
+  const S = (name) => o.sel(name);
+  const app = o.obj(o.cls('NSApplication'), S('sharedApplication'));
+  const bar = app && o.obj(app, S('mainMenu'));
+  const i = editMenuState.index;
+  if (!bar || i < 0 || i >= o.count(bar, S('numberOfItems'))) return null;
+  const item = o.objAt(bar, S('itemAtIndex:'), i);
+  return item ? o.obj(item, S('submenu')) : null;
+}
+// hide what isn't NEO's; returns the menu as seen, for the log
+function hideForeignItems(edit) {
+  const o = objc;
+  const S = (name) => o.sel(name);
+  const ours = editMenuState.ours;
+  const n = o.count(edit, S('numberOfItems'));
+  const seen = [];
+  let j = 0; // the next of NEO's own items to find, in order
+  for (let i = 0; i < n; i++) {
+    const item = o.objAt(edit, S('itemAtIndex:'), i);
+    if (!item) continue;
+    const sep = o.flag(item, S('isSeparatorItem'));
+    const titleObj = sep ? null : o.obj(item, S('title'));
+    const title = titleObj ? o.str(titleObj, S('UTF8String')) : '';
+    const mine = j < ours.length && (sep ? ours[j] === null : ours[j] === menuTitle(title));
+    if (mine) j++;
+    else {
+      // a safety net: whatever happens to titles, an item Electron made
+      // for NEO is never the one hidden
+      const act = sep ? null : o.actionOf(item, S('action'));
+      const electrons = act && ELECTRON_ACTIONS.has(o.selName(act));
+      if (!electrons && !o.flag(item, S('isHidden'))) o.setFlag(item, S('setHidden:'), true);
+    }
+    seen.push((mine ? '' : '[not NEO\'s] ') + (sep ? '—' : title));
+  }
+  return seen;
+}
+function hideSystemEditItems() {
+  if (process.platform !== 'darwin' || editMenuState.hiding) return;
+  editMenuState.hiding = true;
+  try {
+    const edit = editMenuState.edit || (editMenuState.edit = nativeEditMenu());
+    if (edit) hideForeignItems(edit);
+  } catch (err) {
+    logError('edit menu', err);
+  } finally {
+    editMenuState.hiding = false;
+  }
+}
+// a tiny Objective-C class whose one method AppKit calls whenever a menu
+// gains or changes an item; it hides foreign items in the Edit menu
+function watchEditMenu() {
+  if (process.platform !== 'darwin' || editMenuState.watching) return;
+  editMenuState.watching = true;
+  try {
+    const o = objcRuntime();
+    const S = (name) => o.sel(name);
+    // AppKit calls this for every menu in the app as items come and go
+    // (mostly while a menu opens): one lookup, and a pass over the Edit
+    // menu only when it's the Edit menu that changed
+    const imp = o.koffi.register((_self, _cmd, note) => {
+      try {
+        if (editMenuState.hiding || !note) return;
+        const menu = o.obj(note, S('object'));
+        const edit = editMenuState.edit || (editMenuState.edit = nativeEditMenu());
+        if (menu && edit && addr(menu) === addr(edit)) hideSystemEditItems();
+      } catch (err) {
+        logError('edit menu', err);
+      }
+    }, o.koffi.pointer(o.NoteIMP));
+    let cls = o.allocClass(o.cls('NSObject'), 'NEOEditMenuWatcher', 0);
+    if (cls) {
+      o.addMethod(cls, S('neoMenuChanged:'), imp, 'v@:@');
+      o.registerClass(cls);
+    } else cls = o.cls('NEOEditMenuWatcher');
+    const watcher = o.obj(o.obj(cls, S('alloc')), S('init'));
+    const center = o.obj(o.cls('NSNotificationCenter'), S('defaultCenter'));
+    for (const name of ['NSMenuDidAddItemNotification', 'NSMenuDidChangeItemNotification']) {
+      const nsName = o.objStr(o.cls('NSString'), S('stringWithUTF8String:'), name);
+      o.observe(center, S('addObserver:selector:name:object:'), watcher, S('neoMenuChanged:'), nsName, null);
+    }
+  } catch (err) {
+    logError('edit menu', err);
+  }
 }
 
 // Manual update check (Help → Check for Update…): a direct GitHub Releases
@@ -1666,35 +2039,64 @@ function compareVersions(a, b) {
 // newer Chromium ignores attribute changes on text it has already looked at
 ipcMain.handle('app:version', () => app.getVersion());
 
-// Help → Check for Update…
+// Updating
 //
-// Packaged builds update themselves: electron-updater reads the release's
-// latest*.yml, downloads the installer in the background (progress goes to
-// the window), and "Restart to update" swaps the app in. The page saves
-// itself before asking for the restart. A build that can't self-update —
-// `npm start`, the Windows portable .exe, anything unsigned — falls back
-// to the release page on GitHub, as before.
+// Packaged builds keep themselves current without being asked: a few seconds
+// after launch (and every few hours after that) NEO looks at the latest
+// GitHub release, and if it's newer, electron-updater starts downloading it
+// straight away, quietly. The new version goes in the next time NEO quits
+// and opens again. Help → Check for Update… shows where that stands — most
+// often it's already downloaded, and the window offers "Restart to update"
+// (the page saves itself first). A build that can't self-update — `npm
+// start`, the Windows portable .exe, anything unsigned — falls back to the
+// release page on GitHub, as before.
 let updater = null;          // electron-updater's autoUpdater, wired once
 let updaterReady = false;    // an update is downloaded and waiting
+// where the background download stands, so the window can pick it up mid-way
+const upd = { state: 'idle', version: '', percent: 0, transferred: 0, total: 0, message: '' };
 function getUpdater() {
   if (updater || !app.isPackaged) return updater;
   const { autoUpdater } = require('electron-updater');
   autoUpdater.logger = null;
-  autoUpdater.autoDownload = false;      // the writer says when
+  autoUpdater.autoDownload = true;       // found it? fetch it — nobody should have to ask
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('update-available', (info) => {
+    Object.assign(upd, { state: 'downloading', version: info && info.version || '', percent: 0, transferred: 0, total: 0, message: '' });
+    sendToWindow({ type: 'update', ...upd });
+  });
   autoUpdater.on('download-progress', (p) => {
-    sendToWindow({ type: 'update', state: 'downloading', percent: p.percent, transferred: p.transferred, total: p.total });
+    Object.assign(upd, { state: 'downloading', percent: p.percent, transferred: p.transferred, total: p.total });
+    sendToWindow({ type: 'update', ...upd });
   });
   autoUpdater.on('update-downloaded', (info) => {
     updaterReady = true;
-    sendToWindow({ type: 'update', state: 'ready', version: info && info.version });
+    Object.assign(upd, { state: 'ready', percent: 100 });
+    if (info && info.version) upd.version = info.version;
+    sendToWindow({ type: 'update', ...upd });
   });
   autoUpdater.on('error', (err) => {
     logError('updater', err);
-    sendToWindow({ type: 'update', state: 'error', message: String(err && err.message || err) });
+    if (updaterReady) return; // a failed later look doesn't undo a finished download
+    Object.assign(upd, { state: 'error', message: String(err && err.message || err) });
+    sendToWindow({ type: 'update', ...upd });
   });
   updater = autoUpdater;
   return updater;
+}
+
+// one look at GitHub; if something newer is there, the download starts on
+// its own (autoDownload). Never twice at once, and not again once it's here.
+let updateLook = null;
+function lookForUpdate() {
+  const u = getUpdater();
+  if (!u) return Promise.resolve(null);
+  if (updaterReady || upd.state === 'downloading') return Promise.resolve(null);
+  if (!updateLook) {
+    updateLook = u.checkForUpdates()
+      .catch((err) => { logError('updater', err); throw err; })
+      .finally(() => { updateLook = null; });
+  }
+  return updateLook;
 }
 
 // what's on GitHub, for the fallback path and the release link
@@ -1713,11 +2115,19 @@ ipcMain.handle('update:check', async () => {
   try {
     const u = getUpdater();
     if (u) {
-      const result = await u.checkForUpdates();
-      const latestVersion = result && result.updateInfo && result.updateInfo.version || '';
-      const hasUpdate = !!latestVersion && compareVersions(latestVersion, currentVersion) > 0;
+      // already on its way (or already here): just say where it is
+      if (!updaterReady && upd.state !== 'downloading') {
+        if (upd.state === 'error') upd.state = 'idle'; // asking again is a retry
+        const result = await lookForUpdate();
+        const v = result && result.updateInfo && result.updateInfo.version || '';
+        if (v && compareVersions(v, currentVersion) > 0 && upd.state === 'idle') {
+          Object.assign(upd, { state: 'downloading', version: v });
+        }
+      }
       latestReleaseFromGitHub().catch(() => {}); // the release link, for the fallback button
-      return { hasUpdate, latestVersion, currentVersion, canInstall: true, ready: updaterReady };
+      const latestVersion = upd.version;
+      const hasUpdate = !!latestVersion && compareVersions(latestVersion, currentVersion) > 0;
+      return { ...upd, hasUpdate, latestVersion, currentVersion, canInstall: true, ready: updaterReady };
     }
   } catch (err) {
     logError('update', err); // fall through to the plain check
@@ -1733,20 +2143,6 @@ ipcMain.handle('update:check', async () => {
   } catch (err) {
     logError('update', err);
     return { error: true };
-  }
-});
-
-ipcMain.handle('update:download', async () => {
-  const u = getUpdater();
-  if (!u) return false;
-  if (updaterReady) { sendToWindow({ type: 'update', state: 'ready' }); return true; }
-  try {
-    await u.downloadUpdate();
-    return true;
-  } catch (err) {
-    logError('updater', err);
-    sendToWindow({ type: 'update', state: 'error', message: String(err && err.message || err) });
-    return false;
   }
 });
 
@@ -1778,23 +2174,22 @@ if (!app.requestSingleInstanceLock()) {
   });
 }
 
-// A quiet look at startup: nothing downloads, nothing pops up; if a newer
-// NEO exists the window shows one line, once, pointing at Help → Check for
-// Update…. Any failure is logged and swallowed, so an offline machine or an
+// The background look: a few seconds after launch, every hour after that
+// for a writer who leaves NEO open for days, and whenever the computer
+// wakes (a laptop lid is how most NEO sessions end and begin). Nothing pops
+// up; any failure is logged and swallowed, so an offline machine or an
 // unsigned build never notices.
+const UPDATE_EVERY = 60 * 60 * 1000;
 function checkForUpdates() {
   if (!app.isPackaged) return;
-  setTimeout(async () => {
-    try {
-      const u = getUpdater();
-      if (!u) return;
-      const result = await u.checkForUpdates();
-      const v = result && result.updateInfo && result.updateInfo.version || '';
-      if (v && compareVersions(v, app.getVersion()) > 0) sendToWindow({ type: 'update', state: 'available', version: v });
-    } catch (err) {
-      logError('updater', err);
-    }
-  }, 8000);
+  const look = () => { lookForUpdate().catch(() => { /* logged in lookForUpdate */ }); };
+  setTimeout(look, 8000);
+  const timer = setInterval(look, UPDATE_EVERY);
+  if (timer.unref) timer.unref();
+  try {
+    // after a wake the network needs a moment
+    require('electron').powerMonitor.on('resume', () => setTimeout(look, 15000));
+  } catch (err) { logError('updater', err); }
 }
 
 app.whenReady().then(() => {
@@ -1836,6 +2231,8 @@ app.whenReady().then(() => {
         // these two official switches remove the ones writers can't use here
         systemPreferences.setUserDefault('NSDisabledDictationMenuItem', 'boolean', true);
         systemPreferences.setUserDefault('NSDisabledCharacterPaletteMenuItem', 'boolean', true);
+        // AutoFill (contacts, passwords) has no business on a manuscript page
+        systemPreferences.setUserDefault('NSAutoFillHeuristicControllerEnabled', 'boolean', false);
         // …and "Enter Full Screen" into the View menu, next to NEO's own
         // Full Screen item (⇧⌘F): one is enough
         systemPreferences.setUserDefault('NSFullScreenMenuItemEverywhere', 'boolean', false);
@@ -1845,6 +2242,7 @@ app.whenReady().then(() => {
     }
 
     try { initLanguage(); } catch (err) { logError('language', err); }
+    try { checkLibraryWritable(); } catch (err) { logError('library check', err); }
     try { ensureLibrary(); } catch (err) { logError('library', err); }
     createWindow();
     try { initSpell(); } catch (err) { logError('spell', err); }

@@ -11,7 +11,9 @@ NEO runs locally. WIPs are saved in plain files on your disk. No accounts or sub
 Get the latest installer from the **[Releases page](../../releases)**:
 
 - **macOS** — download the `.dmg` for older Intel machines or the arm64 file for Mac silicon. Open it and drag NEO to Applications.
-- **Windows** — download the `.exe` and run it. Or get the setup installer and run that.
+- **Windows** — get `NEO-Setup` (the installer, which keeps itself up to date) and run it, or the `portable` `.exe`, which runs without installing.
+
+  Your library lives in `Documents\NEO Library`. If OneDrive backs up your Documents folder, that puts your books in OneDrive too; File → Library Folder… moves the library anywhere you like. If Windows Security's *Controlled folder access* is on, Windows won't let NEO save in Documents: NEO says so when it starts, and you can allow NEO there or pick another folder.
 - **Linux** — download the `.AppImage`, make it executable, and run it:
 
   ```
@@ -94,7 +96,7 @@ npm start
 
 **View → Keyboard Shortcuts…** opens the shortcut reference. You can also press `Cmd+/` on macOS or `Ctrl+/` on Windows and Linux, or use **Help → NEO Shortcuts**.
 
-To build installers: `npm install electron-builder --save-dev`, then `npm run package` (macOS), `npm run package:win` (Windows), or `npm run package:all`. Output lands in `dist/`.
+To build installers: `npm install electron-builder --save-dev`, then `npm run package` (macOS, also `npm run package:mac`), `npm run package:win` (Windows), or `npm run package:all`. Output lands in `dist/`.
 
 The app is very simple: an Electron shell (`main.js`), a preload bridge (`preload.js`), and a renderer (`app.js` + `styles.css` + `index.html`). If you know JavaScript, you can change NEO. Have at it.
 

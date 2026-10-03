@@ -53,10 +53,13 @@ const tabName = (kind) => {
 // the faint + between boxes): a page a published book carries, a part, a
 // prologue or an epilogue. book.chapterKinds holds the ones that aren't
 // chapters. Chapters are numbered; parts are numbered on their own; the rest
-// go by their names. Prologues, epilogues and chapters are the story: they
-// count toward the words.
-const CHAPTER_KINDS = ['copyright', 'dedication', 'epigraph', 'contents', 'prologue', 'part', 'chapter', 'epilogue', 'acknowledgments', 'about'];
-const STORY_KINDS = ['chapter', 'prologue', 'epilogue'];
+// go by their names. An unnumbered chapter is a chapter that goes by its
+// title alone and stays out of the count — a run of named chapters before
+// the numbering starts, say. Prologues, epilogues and chapters (numbered or
+// not) are the story: they count toward the words. book.restartNumbering
+// starts the chapter count again at 1 after every part.
+const CHAPTER_KINDS = ['copyright', 'dedication', 'epigraph', 'contents', 'prologue', 'part', 'chapter', 'unnumbered', 'epilogue', 'acknowledgments', 'about'];
+const STORY_KINDS = ['chapter', 'unnumbered', 'prologue', 'epilogue'];
 // what comes after the story, where a new chapter never goes
 const BACK_KINDS = ['epilogue', 'acknowledgments', 'about'];
 function chapterKind(chId, meta = book) {
@@ -81,7 +84,10 @@ function chapterRole(chId, meta = book) {
 function kindCount(chId, kind, meta = book) {
   let n = 0;
   for (const c of meta.chapterOrder) {
-    if (chapterKind(c, meta) === kind) n++;
+    const k = chapterKind(c, meta);
+    if (k === kind) n++;
+    // numbering that restarts with each part
+    else if (kind === 'chapter' && k === 'part' && meta.restartNumbering) n = 0;
     if (c === chId) break;
   }
   return n;
@@ -91,10 +97,22 @@ function chapterName(chId, meta = book) {
   const k = chapterKind(chId, meta);
   if (k === 'chapter') return t('Chapter {n}', { n: chapterNumber(chId, meta) });
   if (k === 'part') return partLabel(kindCount(chId, 'part', meta));
+  // an unnumbered chapter is its title
+  if (k === 'unnumbered') return ((meta.chapterTitles || {})[chId] || '').trim() || t('Untitled');
   return kindName(k);
+}
+// a chapter's heading as the reader sees it: its name, then any title —
+// once, for an unnumbered chapter, whose name is its title
+function chapterHeading(chId, meta = book, sep = ' — ') {
+  const title = ((meta.chapterTitles || {})[chId] || '').trim();
+  const k = chapterKind(chId, meta);
+  if (k === 'unnumbered') return title;
+  if (!title) return chapterName(chId, meta);
+  return library.exportCustomChapterTitles ? title : chapterName(chId, meta) + sep + title;
 }
 function kindName(kind) {
   if (kind === 'chapter') return t('Chapter');
+  if (kind === 'unnumbered') return t('Unnumbered Chapter');
   if (kind === 'contents') return t('Contents');
   return pageKindName(kind);
 }
@@ -106,8 +124,21 @@ function chapterMark(chId, meta = book) {
   if (k === 'part') return roman(kindCount(chId, 'part', meta));
   return '❦';
 }
-// how many numbered chapters the book has
-const numberedChapters = (meta = book) => meta.chapterOrder.filter((c) => chapterKind(c, meta) === 'chapter').length;
+// how many numbered chapters the book has — or, when numbering restarts
+// with each part, how many share chId's part
+function numberedChapters(meta = book, chId = null) {
+  let n = 0, total = 0, found = false;
+  for (const c of meta.chapterOrder) {
+    const k = chapterKind(c, meta);
+    if (k === 'part' && meta.restartNumbering && chId) {
+      if (found) break;
+      n = 0;
+    }
+    if (c === chId) found = true;
+    if (k === 'chapter') { n++; total++; }
+  }
+  return chId && meta.restartNumbering ? n : total;
+}
 // A story of one chapter is just "the story": no heading, no number, until a
 // second chapter (or a prologue, an epilogue or a part) joins it. The pages
 // around it don't count.
@@ -178,6 +209,8 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 const IS_MAC = navigator.platform.toLowerCase().includes('mac');
 // a touch screen (Pocket): nothing to hover, no right button
 const NO_HOVER = !!(window.matchMedia && window.matchMedia('(hover: none)').matches) || !!window.Capacitor;
+// NEO Pocket (the Android and iOS shell)
+const IS_POCKET = !!window.Capacitor;
 
 // Touch has no right-click: a long press on a book, a shelf name or a chapter
 // heading opens the same menu. Not inside the text itself — there a long
@@ -265,7 +298,9 @@ function askInput(title, placeholder, value = '') {
     bd.querySelector('.m-cancel').onclick = () => done(null);
     input.onkeydown = (e) => {
       if (e.key === 'Enter') done(input.value.trim());
-      if (e.key === 'Escape') done(null);
+      // the prompt is gone by the time Esc bubbles up, so without this the
+      // editor's own Esc would close the book too
+      if (e.key === 'Escape') { e.stopPropagation(); done(null); }
     };
   });
 }
@@ -438,7 +473,15 @@ function cleanChapterEl(id) {
   holder.querySelectorAll('.darling-anchor, .ph-mark, .ghost').forEach((n) => n.remove());
   return holder;
 }
-const chapterText = (id) => cleanChapterEl(id).innerText;
+// Text a line to each paragraph. innerText does that only for what is laid
+// out on screen: of a copy held aside, like the one above, it runs one
+// paragraph's last word into the next one's first ("end.Next"), and the two
+// count as one word. A range's toString runs them together the same way.
+function plainText(root) {
+  root.querySelectorAll('p, div, br').forEach((el) => el.after('\n'));
+  return root.textContent;
+}
+const chapterText = (id) => plainText(cleanChapterEl(id));
 
 // Word counts are cached per chapter and only recomputed for the chapter being edited.
 let wordCache = {};
@@ -1648,6 +1691,7 @@ function bookTile(meta, opts = {}) {
     if (meta.coverImage) {
       options.push({ label: t('Remove cover art'), desc: t('Deletes the image from the book folder. (To just hide it, use the ↻ on the book.)'), danger: true, value: 'uncover' });
     }
+    if (!window.Capacitor) options.push({ label: t('Save cover as image…'), desc: t('Full size, with your title and author.'), value: 'saveCover' });
     // Pocket has no File menu: export lives here and in the ⋯ sheet
     if (window.Capacitor) options.push({ label: t('Export…'), desc: t('Text, Markdown, HTML, Word or EPUB, through the share sheet.'), value: 'export' });
     options.push(
@@ -1688,6 +1732,8 @@ function bookTile(meta, opts = {}) {
       }
     } else if (choice === 'refresh') {
       await refreshCover(meta, el);
+    } else if (choice === 'saveCover') {
+      await saveCoverImage(meta);
     } else if (choice === 'uncover') {
       await window.neo.removeCover(meta.id);
       meta.coverImage = null;
@@ -1715,6 +1761,27 @@ function bookTile(meta, opts = {}) {
     }
   });
   return el;
+}
+
+// The cover as a picture file: the writer's own image just as they gave it;
+// otherwise the abstract at full size (1600×2560, KDP's ratio) with the
+// title and author set on it. A painted cover never leaves NEO, here as in
+// the exports, so a book showing one saves its abstract.
+async function saveCoverImage(meta) {
+  const defaultName = safeName(meta.title) + '-cover';
+  let payload = null;
+  if (coverMode(meta) === 'image') {
+    const c = await window.neo.readCover(meta.id, meta.coverImage);
+    if (c) payload = { format: c.ext, defaultName, content: c.base64, base64: true };
+  }
+  if (!payload) {
+    await NeoCovers.ready;
+    // JPEG: what KDP asks for, and a tenth the size of a PNG of all that grain
+    const url = NeoCovers.renderFull(meta, {}).toDataURL('image/jpeg', 0.92);
+    payload = { format: 'jpg', defaultName, content: url.split(',')[1], base64: true };
+  }
+  const saved = await window.neo.exportSave(payload);
+  if (saved) toast(t('Saved: {file}', { file: saved.split(/[\\/]/).pop() }));
 }
 
 /* ---- painted covers ----
@@ -2127,14 +2194,10 @@ async function openBook(bookId) {
     if (isNew) {
       $('#tp-title').focus();
     } else if (book.lastPosition && book.chapterOrder.includes(book.lastPosition.chapterId)) {
-      // pick up right where you left off
+      // pick up right where you left off — here, or on the other device
       currentChapterId = book.lastPosition.chapterId;
-      const scroll = book.lastPosition.scroll || 0;
-      requestAnimationFrame(() => {
-        $('#paper-scroll').scrollTop = scroll;
-        highlightNav();
-        updateCounters();
-      });
+      const pos = book.lastPosition;
+      requestAnimationFrame(() => resumePosition(pos));
     }
   }
 
@@ -2168,6 +2231,7 @@ function renderChapters() {
     if (role) sec.classList.add(role);
     const head = document.createElement('div');
     head.className = 'chapter-head';
+    if (kind === 'unnumbered') head.classList.add('no-number');
     head.id = 'ch-head-' + chId;
     const num = document.createElement('span');
     num.className = 'ch-num';
@@ -2189,7 +2253,7 @@ function renderChapters() {
         head.classList.toggle('has-title', titleSpan.textContent.trim() !== '');
       });
       titleSpan.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && e.shiftKey) {
+        if (e.key === 'Enter' && e.shiftKey && (e.metaKey || e.ctrlKey)) {
           e.preventDefault();
           titleSpan.blur();
           poetryUnderHeading(sec.querySelector('.chapter-body'), chId);
@@ -2230,6 +2294,7 @@ function renderChapters() {
     body.spellcheck = false; // NEO runs its own spellcheck pass
     if (!story) body.classList.add('no-cap');
     body.innerHTML = chapterHTML[chId] || '<p><br></p>';
+    markDialogueOpening(body);
     if (PAGE_PROMPTS[kind]) {
       body.dataset.ph = PAGE_PROMPTS[kind]();
       const blank = () => body.classList.toggle('blank', !body.textContent.trim());
@@ -2312,9 +2377,37 @@ async function chapterMenu(chId, x = 0, y = 0, from = null) {
     // one contents per book, and never over words: it would hide them
     disabled: k === 'contents' && k !== kind && (otherContents || words > 0)
   }));
+  // any piece of the story can leave on its own — to a beta reader, an
+  // editor, a magazine — in any format the book can
+  if (STORY_KINDS.includes(kind) && words > 0) items.push('-', { label: t('Export Chapter…'), value: 'export' });
+  // one switch for the whole book, where the parts are: count chapters
+  // from 1 again after each part
+  if (kind === 'part') {
+    items.push('-', { label: t('Restart Chapter Numbers at Each Part'), value: 'restart', checked: !!book.restartNumbering });
+  }
   items.push('-', { label: t('Delete'), value: 'delete', danger: true });
   const choice = await popMenu(x, y, items, { title: chapterName(chId), from: from || document.querySelector(`.nav-item[data-id="${chId}"] .n-row`) });
   if (!choice || choice === kind) return null;
+  if (choice === 'export') {
+    const formats = [
+      { label: t('Text (.txt)'), value: 'txt' }, { label: t('Markdown (.md)'), value: 'md' }, { label: t('HTML (.html)'), value: 'html' },
+      // PDF is made by the desktop app; Pocket shares the others
+      ...(window.Capacitor ? [] : [{ label: 'PDF (.pdf)', value: 'pdf' }]),
+      { label: t('Word (.docx)'), value: 'docx' }, { label: t('EPUB (.epub)'), value: 'epub' }
+    ];
+    const fmt = await optionModal(t('Export “{title}”', { title: chapterHeading(chId) || chapterName(chId) }), null, formats);
+    if (fmt) await doExport(fmt, chId);
+    return null;
+  }
+  if (choice === 'restart') {
+    if (book.restartNumbering) delete book.restartNumbering;
+    else book.restartNumbering = true;
+    await saveMeta();
+    renderChapters();
+    if (currentTab === 'outline') renderOutline();
+    updateCounters();
+    return choice;
+  }
   if (choice === 'delete') {
     await deleteChapterToDarlings(chId);
     if (currentTab === 'outline') renderOutline();
@@ -2350,6 +2443,7 @@ function wireChapterBody(body, chId) {
 
   body.addEventListener('input', () => {
     breakRun = 0; // fresh typing: ⌘Z belongs to the engine again
+    markDialogueOpening(body);
     chapterHTML[chId] = captureBody(body);
     wordCache[chId] = null;
     scheduleChapterSave(chId);
@@ -2363,14 +2457,22 @@ function wireChapterBody(body, chId) {
     e.preventDefault();
     const html = e.clipboardData.getData('text/html');
     const text = e.clipboardData.getData('text/plain');
+    // hyphens set as dialogue dashes, the same as typing them
+    const edges = caretEdges(body);
     if (html) {
-      document.execCommand('insertHTML', false, cleanPasteHtml(html));
+      document.execCommand('insertHTML', false, cleanPasteHtml(html, { style: dashStyle(), ...edges }));
       reconcileMarks();
     } else if (text) {
       const parts = text.replace(/\r/g, '').split(/\n+/).filter((p) => p.trim());
       parts.forEach((p, i) => {
         if (i > 0) document.execCommand('insertParagraph');
-        document.execCommand('insertText', false, p.trim());
+        const line = dialogueDashes(p.trim(), dashStyle(), { start: i > 0 || edges.start, end: i < parts.length - 1 || edges.end, spaced: i === 0 && edges.spaced });
+        // plain text written in Markdown keeps its *italics* and **bold**
+        const styled = library && library.markdownOff ? null : markdownInline(line);
+        if (styled) {
+          document.execCommand('insertHTML', false, styled);
+          stripJunkSpans(body); // the engine wraps inserted HTML in style spans
+        } else document.execCommand('insertText', false, line);
       });
     }
   });
@@ -2379,7 +2481,10 @@ function wireChapterBody(body, chId) {
   body.addEventListener('compositionstart', () => { composing = true; });
   body.addEventListener('compositionend', () => { composing = false; });
   body.addEventListener('keydown', (e) => {
-    if (composing || e.isComposing || e.keyCode === 229) return;
+    // An input method mid-word owns the keys. Its marker (keyCode 229) also
+    // rides on Enter with nothing being composed, as on GNOME (Wayland, IBus),
+    // where it kept ⇧Enter and ⌘⇧Enter from ever reaching NEO.
+    if (composing || e.isComposing || (e.keyCode === 229 && e.key !== 'Enter')) return;
     // count consecutive Enters — the double/triple rhythm works mid-sentence
     if (e.key === 'Enter' && !e.shiftKey) enterRun++;
     else enterRun = 0;
@@ -2402,12 +2507,15 @@ function wireChapterBody(body, chId) {
     }
     if (styleKeepScroll(e)) return;
     if (handlePoetry(e, body, chId)) return;
+    if (handleFlush(e, body, chId)) return;
     if (poetryBackspace(e, body, chId)) return;
     if (sceneBreakDelete(e, body, chId)) return;
     if (spaceSafeDelete(e, body, chId)) return;
     if (emptyChapterBackspace(e, body, chId)) return;
     if (chapterStartBackspace(e, body, chId)) return;
     if (guardMarkerDelete(e, body, chId)) return;
+    // "Espere -" then Enter: the dash goes in before the paragraph ends
+    if (e.key === 'Enter') dialogueDashKey(e, body);
     if (handleEnter(e, body, chId)) return;
     if (handleTabSpacing(e)) return;
     smartKeys(e, body);
@@ -2429,6 +2537,14 @@ function wireChapterBody(body, chId) {
       s.removeAllRanges();
       s.addRange(r);
     }
+  });
+  // A line break the engine is about to make on its own is ⇧Enter that the
+  // keys above never saw (an input method can carry it past them): it
+  // becomes the flush paragraph ⇧Enter makes, or the next line of a poem.
+  body.addEventListener('beforeinput', (e) => {
+    if (e.inputType !== 'insertLineBreak' || e.defaultPrevented) return;
+    const key = { key: 'Enter', shiftKey: true, metaKey: false, ctrlKey: false, altKey: false, preventDefault: () => e.preventDefault() };
+    if (!handlePoetry(key, body, chId)) handleFlush(key, body, chId);
   });
   // the moment writing hits a ghost, it becomes prose
   // (it keeps its data-sec-id so the outline knows it's been written)
@@ -2472,6 +2588,38 @@ function focusChapterStart(chId) {
   highlightNav();
 }
 
+// The caret at the last character of a chapter, inside its last paragraph,
+// with the view kept where the writer is — not thrown to the chapter's top
+function focusChapterEnd(chId) {
+  const nb = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+  if (!nb) return;
+  if (!nb.isContentEditable) { showEntry(chId); return; }
+  nb.focus({ preventScroll: true });
+  const nr = document.createRange();
+  const paras = nb.querySelectorAll('p');
+  const last = paras[paras.length - 1];
+  if (last) {
+    // the last text node that's really editable (skips placeholders and ghosts)
+    const walk = document.createTreeWalker(last, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement && n.parentElement.isContentEditable
+        ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+    });
+    let text = null;
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) text = n;
+    if (text) nr.setStart(text, text.length);
+    else nr.setStart(last, 0); // an empty last line: before its <br>
+  } else {
+    nr.selectNodeContents(nb);
+  }
+  nr.collapse(true);
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(nr);
+  currentChapterId = chId;
+  highlightNav();
+  revealCaret();
+}
+
 // Backspace in an empty chapter deletes it:
 function emptyChapterBackspace(e, body, chId) {
   if (e.key !== 'Backspace' || e.metaKey || e.ctrlKey || e.altKey) return false;
@@ -2483,7 +2631,7 @@ function emptyChapterBackspace(e, body, chId) {
   breakRun++;
   if (idx > 0) {
     const prev = book.chapterOrder[idx - 1];
-    deleteChapterQuiet(chId).then(() => { focusChapter(prev); resetNativeUndo(); });
+    deleteChapterQuiet(chId).then(() => { focusChapterEnd(prev); resetNativeUndo(); });
   } else {
     // an empty chapter 1 dissolves too — the caret lands at the top of
     // what just became the new chapter 1
@@ -2497,16 +2645,59 @@ function emptyChapterBackspace(e, body, chId) {
 // selection "into view" and mis-measures NEO's transformed page column,
 // throwing the reader to the top of the screen. Style, don't scroll.
 function styleKeepScroll(e) {
-  if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return false;
-  if (e.code !== 'KeyB' && e.code !== 'KeyI') return false;
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return false;
+  const cmd = e.shiftKey
+    ? (e.code === 'KeyS' ? 'strikeThrough' : null)
+    : ({ KeyB: 'bold', KeyI: 'italic', KeyU: 'underline' })[e.code];
+  if (!cmd) return false;
   e.preventDefault();
   const sc = $('#paper-scroll');
   const keep = sc.scrollTop;
-  document.execCommand(e.code === 'KeyB' ? 'bold' : 'italic');
+  document.execCommand(cmd);
   sc.scrollTop = keep;
   requestAnimationFrame(() => { sc.scrollTop = keep; });
   return true;
 }
+
+// A click on the page's empty space puts the caret where it means: below
+// the text, at the end of that chapter; in the margin beside a line, on that
+// line; above the first line, at the start. Margins, the space under the
+// last line, the gaps between chapters and the dark room around the pages
+// all count.
+function caretFromEmptyClick(e) {
+  if (e.button !== 0 || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (!book || currentTab !== 'manuscript') return;
+  const t = e.target;
+  if (!t || !t.closest || t.closest('[contenteditable="true"], input, textarea, button, a, .pop-menu, .ph-mark, #title-page')) return;
+  if (t.closest('.chapter-head') && t !== t.closest('.chapter-head')) return; // its number and title answer clicks themselves
+  if (!(t.matches('.chapter, .chapter-head, #chapters, #paper, #paper-scroll, #editor-view'))) return;
+  // the chapter whose page this is, or the one just above a gap
+  let sec = t.closest('.chapter');
+  if (!sec) {
+    for (const c of document.querySelectorAll('#chapters .chapter')) {
+      if (c.getBoundingClientRect().top <= e.clientY) sec = c; else break;
+    }
+  }
+  if (!sec) return;
+  const body = sec.querySelector('.chapter-body');
+  if (!body || !body.isContentEditable) return;
+  const box = body.getBoundingClientRect();
+  const chId = sec.dataset.id;
+  e.preventDefault();
+  if (e.clientY < box.top) { focusChapterStart(chId); return; }
+  if (e.clientY > box.bottom) { focusChapter(chId); return; }
+  const x = Math.min(Math.max(e.clientX, box.left + 2), box.right - 2);
+  const r = document.caretRangeFromPoint(x, e.clientY);
+  if (!r || !body.contains(r.startContainer)) { focusChapter(chId); return; }
+  body.focus({ preventScroll: true });
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(r);
+  currentChapterId = chId;
+  highlightNav();
+  updateCounters();
+}
+$('#editor-view').addEventListener('mousedown', caretFromEmptyClick);
 
 // ⌥⌘↓ / ⌥⌘↑ (Ctrl+Alt on Windows and Linux): the start of the next or the
 // previous chapter, without opening the pane
@@ -2557,6 +2748,23 @@ function chapterStartBackspace(e, body, chId) {
   pre.selectNodeContents(body);
   try { pre.setEnd(r.startContainer, r.startOffset); } catch { return false; }
   if (pre.toString().length !== 0) return false; // caret isn't at the chapter's first character
+  // …and on its first line. Below an empty line, Backspace takes the empty
+  // line away and the paragraph moves up to the top of the chapter; it
+  // never reaches past it into the chapter above.
+  let el = r.startContainer.nodeType === Node.TEXT_NODE ? r.startContainer.parentElement : r.startContainer;
+  const block = el && el.closest ? el.closest('p') : null;
+  if (block && body.contains(block) && block !== body.firstElementChild) {
+    const above = block.previousElementSibling;
+    if (!above || above.tagName !== 'P' || above.classList.contains('scene-break') || above.classList.contains('ghost')) return false;
+    e.preventDefault();
+    snapshotStructure('empty line removed');
+    above.remove();
+    placeCaret(block, 0);
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    return true;
+  }
   const idx = book.chapterOrder.indexOf(chId);
   if (idx <= 0) return false;
   const prevId = book.chapterOrder[idx - 1];
@@ -2793,6 +3001,15 @@ let enterRun = 0;
 let breakRun = 0;
 
 function splitChapterAt(body, chId, block, sel) {
+  // an empty line is no way to start a chapter, or end one: blank lines at
+  // the seam stay behind (the new chapter opens on its first words)
+  const blank = (p) => p && p.tagName === 'P' && !p.classList.contains('scene-break') && p.textContent.trim() === '' && !p.querySelector('.ph-mark');
+  while (blank(block) && block.nextElementSibling) {
+    const next = block.nextElementSibling;
+    block.remove();
+    block = next;
+  }
+  while (blank(block.previousElementSibling) && block.previousElementSibling.previousElementSibling) block.previousElementSibling.remove();
   const parts = [];
   let n = block;
   while (n) {
@@ -2840,12 +3057,12 @@ function handleEnter(e, body, chId) {
   // Enter in a poetry paragraph steps back into prose: an empty line becomes
   // an ordinary paragraph in place; otherwise the line splits and the new
   // paragraph is plain (⇧Enter is how the poem continues)
-  if (block.classList.contains('poetry')) {
+  if (block.classList.contains('poetry') || block.classList.contains('flush')) {
     e.preventDefault();
     enterRun = 0;
     if (block.textContent.trim() === '') {
       snapshotStructure('poetry paragraph to prose');
-      block.classList.remove('poetry');
+      block.classList.remove('poetry', 'flush');
       romanize(block);
       placeCaret(block, 0);
       syncChapter(body, chId);
@@ -2853,11 +3070,12 @@ function handleEnter(e, body, chId) {
       breakRun++;
       return true;
     }
+    const wasPoetry = block.classList.contains('poetry');
     document.execCommand('insertParagraph');
     const cur = caretBlock(body);
     if (cur && cur !== block) {
-      cur.classList.remove('poetry');
-      romanize(cur);
+      cur.classList.remove('poetry', 'flush');
+      if (wasPoetry) romanize(cur);
       placeCaret(cur, 0);
     }
     syncChapter(body, chId);
@@ -2888,7 +3106,10 @@ function handleEnter(e, body, chId) {
       // a break made by the full double-Enter gesture un-splits on undo too
       snapshotStructure('section break', { rejoin: enterRun >= 2 });
       if (prev.textContent.trim() === '') {
-        prev.classList.add('scene-break');
+        // a break is only a break: no alignment or paragraph kind carried
+        // over from the paragraph it was made in (a justified one set it left)
+        prev.removeAttribute('style');
+        prev.className = 'scene-break';
         prev.textContent = '***';
       } else {
         const brk = document.createElement('p');
@@ -2934,7 +3155,8 @@ function handleEnter(e, body, chId) {
   if (prev) {
     e.preventDefault();
     snapshotStructure('section break', { rejoin: enterRun >= 2 });
-    block.classList.add('scene-break');
+    block.removeAttribute('style'); // (see above: a break carries nothing over)
+    block.className = 'scene-break';
     block.textContent = '***';
     const np = document.createElement('p');
     np.innerHTML = '<br>';
@@ -2953,9 +3175,12 @@ function handleEnter(e, body, chId) {
 }
 
 /* ================================================================== */
-/*  POETRY PARAGRAPHS — ⇧Enter                                         */
+/*  POETRY PARAGRAPHS — ⌘⇧Enter (Ctrl+Shift+Enter)                     */
 /*  A paragraph pulled in from the margins, italic: a stanza of verse,  */
 /*  a quote, a POV name under the chapter heading. One class, one key.  */
+/*  FLUSH PARAGRAPHS — ⇧Enter                                          */
+/*  Prose with no first-line indent: a report, a list, an email, a     */
+/*  sign in the story. ⇧Enter again gives another; Enter is prose.     */
 /* ================================================================== */
 
 // the paragraph holding the caret, if it belongs to this chapter body
@@ -3001,15 +3226,18 @@ function placeCaret(node, offset) {
   sel.addRange(r);
 }
 
-// ⇧Enter. At the end of a paragraph: a new poetry paragraph beneath it.
-// Mid-paragraph: the text after the caret becomes one. Inside a poetry
-// paragraph: another line of it, so verse flows. On a *** line: nothing.
+// ⌘⇧Enter (Ctrl+Shift+Enter). At the end of a paragraph: a new poetry
+// paragraph beneath it. Mid-paragraph: the text after the caret becomes
+// one. Inside a poetry paragraph, ⇧Enter or ⌘⇧Enter: another line of it,
+// so verse flows. On a *** line: nothing.
 function handlePoetry(e, body, chId) {
-  if (e.key !== 'Enter' || !e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return false;
+  if (e.key !== 'Enter' || !e.shiftKey || e.altKey) return false;
   const sel = window.getSelection();
   if (!sel.rangeCount || !sel.isCollapsed) return false;
   const block = caretBlock(body);
   if (!block) return false;
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod && !block.classList.contains('poetry')) return false; // ⇧Enter alone: a flush paragraph
   e.preventDefault();
   if (block.classList.contains('scene-break')) return true;
 
@@ -3036,6 +3264,7 @@ function handlePoetry(e, body, chId) {
   const atStart = after.length === block.textContent.length;
   if (empty || atStart) {
     // an empty paragraph, or the caret at its very start: the whole paragraph turns to poetry
+    block.classList.remove('flush');
     block.classList.add('poetry');
     italicize(block);
     caretIntoStart(block);
@@ -3057,14 +3286,54 @@ function handlePoetry(e, body, chId) {
   return true;
 }
 
-// Backspace at the very start of a poetry paragraph makes it prose again —
-// the second Backspace then merges it upward like any paragraph
+// ⇧Enter. At the end of a paragraph: a flush paragraph beneath it.
+// Mid-paragraph: the text after the caret becomes one. At the start of a
+// paragraph (or in an empty one): that paragraph goes flush. Inside a flush
+// paragraph: another one. On a *** line: nothing.
+function handleFlush(e, body, chId) {
+  if (e.key !== 'Enter' || !e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return false;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.isCollapsed) return false;
+  const block = caretBlock(body);
+  if (!block) return false;
+  e.preventDefault();
+  if (block.classList.contains('scene-break')) return true;
+  if (block.querySelector('span:not(.ph-mark)')) stripJunkSpans(block);
+  if (block.classList.contains('flush')) {
+    // the engine's own split keeps the class on the new line, and ⌘Z sees it
+    document.execCommand('insertParagraph');
+    const cur = caretBlock(body);
+    if (cur) cur.classList.add('flush');
+    syncChapter(body, chId);
+    return true;
+  }
+  const r = sel.getRangeAt(0);
+  const head = document.createRange();
+  head.selectNodeContents(block);
+  try { head.setEnd(r.startContainer, r.startOffset); } catch { return true; }
+  if (block.textContent.trim() === '' || head.toString().length === 0) {
+    snapshotStructure('flush paragraph');
+    block.classList.add('flush');
+    syncChapter(body, chId);
+    resetNativeUndo();
+    breakRun++;
+    return true;
+  }
+  document.execCommand('insertParagraph');
+  const cur = caretBlock(body);
+  if (cur && cur !== block) cur.classList.add('flush');
+  syncChapter(body, chId);
+  return true;
+}
+
+// Backspace at the very start of a poetry or flush paragraph makes it prose
+// again — the second Backspace then merges it upward like any paragraph
 function poetryBackspace(e, body, chId) {
   if (e.key !== 'Backspace' || e.metaKey || e.ctrlKey || e.altKey) return false;
   const sel = window.getSelection();
   if (!sel.rangeCount || !sel.isCollapsed) return false;
   const block = caretBlock(body);
-  if (!block || !block.classList.contains('poetry')) return false;
+  if (!block || !(block.classList.contains('poetry') || block.classList.contains('flush'))) return false;
   const r = sel.getRangeAt(0);
   const head = document.createRange();
   head.selectNodeContents(block);
@@ -3072,8 +3341,8 @@ function poetryBackspace(e, body, chId) {
   if (head.toString().length !== 0) return false;
   e.preventDefault();
   snapshotStructure('poetry paragraph to prose');
-  block.classList.remove('poetry');
-  romanize(block);
+  if (block.classList.contains('poetry')) romanize(block);
+  block.classList.remove('poetry', 'flush');
   placeCaret(block, 0);
   syncChapter(body, chId);
   resetNativeUndo();
@@ -3081,8 +3350,11 @@ function poetryBackspace(e, body, chId) {
   return true;
 }
 
-// Format → Poetry Paragraph: toggles every paragraph the selection touches
-function togglePoetry() {
+// Format → Poetry Paragraph / Flush Paragraph: toggles every paragraph the
+// selection touches (a paragraph is one or the other, or plain prose)
+function togglePoetry() { toggleParaKind('poetry'); }
+function toggleFlush() { toggleParaKind('flush'); }
+function toggleParaKind(kind) {
   const sel = window.getSelection();
   if (!sel.rangeCount) { toast(t('Click into a paragraph first')); return; }
   const r = sel.getRangeAt(0);
@@ -3095,11 +3367,14 @@ function togglePoetry() {
     (p) => r.intersectsNode(p) && !p.classList.contains('scene-break')
   );
   if (!ps.length) return;
-  snapshotStructure('poetry paragraph');
-  const on = !ps.every((p) => p.classList.contains('poetry'));
+  snapshotStructure(kind + ' paragraph');
+  const on = !ps.every((p) => p.classList.contains(kind));
   for (const p of ps) {
-    p.classList.toggle('poetry', on);
-    if (on) italicize(p); else romanize(p);
+    const wasPoetry = p.classList.contains('poetry');
+    p.classList.remove('poetry', 'flush');
+    if (on) p.classList.add(kind);
+    if (kind === 'poetry' && on) italicize(p);
+    else if (wasPoetry) romanize(p);
   }
   caretIntoStart(ps[0]);
   syncChapter(body, chId);
@@ -3154,11 +3429,39 @@ function sceneBreakDelete(e, body, chId) {
 
 // Read a body's HTML for saving:
 function captureBody(body) {
-  // (a page marks the lines that say who said it, for the screen only)
-  return body.innerHTML.replace(/(<p\b[^>]*?) data-attr=""/g, '$1');
+  // (a page marks the lines that say who said it, and a chapter the speech
+  // after a scene break, for the screen only)
+  return body.innerHTML.replace(/<p\b[^>]*>/g, (tag) => tag.replace(/ data-(?:attr|speech|first)=""/g, ''));
+}
+
+// A chapter that opens on a line of dialogue sets no drop cap: the dash
+// itself would be the letter enlarged. That line, and one that follows a
+// scene break, keep their indent where prose is set flush, so the speech
+// lines up with the lines that answer it. The marks are never saved.
+const OPENING_DASH = /^\s*[-‐‑‒–—―]/;
+// A chapter's opening paragraph — the one with the drop cap and no indent —
+// is its first paragraph with words in it, past a blank line or a *** at the
+// top (the exports skip those too). Poetry stands apart. In an empty
+// chapter it's the paragraph waiting for the first word. Marked data-first,
+// for the screen only.
+function openingPara(body) {
+  const ps = [...body.children].filter((p) => p.tagName === 'P' && !p.classList.contains('poetry') && !p.classList.contains('scene-break') && !p.classList.contains('ghost'));
+  return ps.find((p) => p.textContent.trim() !== '') || ps[0] || null;
+}
+function markDialogueOpening(body) {
+  const first = openingPara(body);
+  for (const p of body.querySelectorAll('p[data-first]')) if (p !== first) p.removeAttribute('data-first');
+  if (first && !first.hasAttribute('data-first')) first.setAttribute('data-first', '');
+  body.classList.toggle('opens-dialogue', !!first && OPENING_DASH.test(first.textContent));
+  for (const p of body.querySelectorAll('p[data-speech]')) if (!p.matches('.scene-break + p')) p.removeAttribute('data-speech');
+  for (const p of body.querySelectorAll('p.scene-break + p')) {
+    const speech = OPENING_DASH.test(p.textContent);
+    if (p.hasAttribute('data-speech') !== speech) p.toggleAttribute('data-speech', speech);
+  }
 }
 
 function syncChapter(body, chId) {
+  markDialogueOpening(body);
   chapterHTML[chId] = captureBody(body);
   wordCache[chId] = null;
   scheduleChapterSave(chId);
@@ -3170,6 +3473,7 @@ function syncChapter(body, chId) {
 let lastCaretPara = null;
 let capOffBody = null;
 let menuPoetryState = false;
+let menuFlushState = false;
 document.addEventListener('selectionchange', () => {
   if (!book || currentTab !== 'manuscript') return;
   const sel = window.getSelection();
@@ -3197,8 +3501,13 @@ document.addEventListener('selectionchange', () => {
     menuPoetryState = inPoetry;
     window.neo.poetryState(inPoetry);
   }
+  const inFlush = !!(caretP && caretP.classList.contains('flush'));
+  if (inFlush !== menuFlushState && window.neo.flushState) {
+    menuFlushState = inFlush;
+    window.neo.flushState(inFlush);
+  }
   const inFirst = caretP && caretP.parentElement &&
-    caretP === caretP.parentElement.querySelector('p:not(.poetry)');
+    caretP.hasAttribute('data-first');
   const capBody = inFirst ? caretP.parentElement : null;
   if (capBody !== capOffBody) {
     if (capOffBody && capOffBody.isConnected) capOffBody.classList.remove('cap-off');
@@ -3207,12 +3516,32 @@ document.addEventListener('selectionchange', () => {
   }
 });
 
+// Does the caret sit at the start or the end of its paragraph, or after a
+// space? What's pasted there opens or ends the paragraph only if so.
+function caretEdges(body) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return { start: true, end: true };
+  const range = sel.getRangeAt(0);
+  const node = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  const block = node && node.closest('p, div, li');
+  if (!block || !body.contains(block)) return { start: true, end: true };
+  const pre = document.createRange();
+  pre.selectNodeContents(block);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const post = document.createRange();
+  post.selectNodeContents(block);
+  post.setStart(range.endContainer, range.endOffset);
+  const before = pre.toString();
+  return { start: !before.trim(), end: !post.toString().trim(), spaced: /\s$/.test(before) };
+}
+
 // Reduce pasted HTML to what a manuscript is made of: paragraphs, bold,
 // italic. Word, Apple Notes, Google Docs and browsers each dress a
 // paragraph differently — <p>, <div>, a line break inside a block, styled
 // spans — so every block boundary and <br> becomes a paragraph break, and
 // styling that only lives in a style attribute is read as bold/italic.
-function cleanPasteHtml(html) {
+// dashes: { style, ...caretEdges } sets dialogue dashes, for the manuscript.
+function cleanPasteHtml(html, dashes) {
   // parsed off to the side: nothing in a clipboard loads or runs
   const holder = new DOMParser().parseFromString(html, 'text/html').body;
   holder.querySelectorAll('script,style,meta,link,img,table,head,title').forEach((n) => n.remove());
@@ -3229,6 +3558,7 @@ function cleanPasteHtml(html) {
     const ital = (st.fontStyle || '').toLowerCase() === 'italic';
     if (bold) { const b = document.createElement('b'); while (sp.firstChild) b.appendChild(sp.firstChild); sp.appendChild(b); }
     if (ital) { const i = document.createElement('i'); while (sp.firstChild) i.appendChild(sp.firstChild); sp.appendChild(i); }
+    // (underline and strikethrough in a style are read by paraRuns)
   });
   // a break marker at every block edge and every line break
   const BREAK = '\uE000';
@@ -3245,16 +3575,24 @@ function cleanPasteHtml(html) {
     const pieces = r.text.split(BREAK);
     pieces.forEach((text, i) => {
       if (i > 0) paras.push([]);
-      if (text) paras[paras.length - 1].push({ text, b: r.b, i: r.i });
+      if (text) paras[paras.length - 1].push({ text, b: r.b, i: r.i, u: r.u, s: r.s });
     });
   }
-  const out = paras.map((runs) => {
+  const filled = paras.map((runs) => runs.some((r) => r.mark === undefined && r.text.trim()));
+  const out = paras.map((runs, n) => {
     // whitespace collapses like HTML's, and each paragraph is trimmed
     runs = runs.map((r) => (r.mark !== undefined ? r : { ...r, text: r.text.replace(/\s+/g, ' ') }));
     const first = runs.find((r) => r.mark === undefined);
     if (first) first.text = first.text.replace(/^\s+/, '');
     const last = [...runs].reverse().find((r) => r.mark === undefined);
     if (last) last.text = last.text.replace(/\s+$/, '');
+    if (dashes) {
+      dashRuns(runs, dashes.style, {
+        start: n !== filled.indexOf(true) || dashes.start,
+        end: n !== filled.lastIndexOf(true) || dashes.end,
+        spaced: n === filled.indexOf(true) && dashes.spaced
+      });
+    }
     const inner = runs.map((r) => {
       if (r.mark !== undefined) {
         // placeholder marks travel with their text; reconcileMarks pairs
@@ -3264,10 +3602,7 @@ function cleanPasteHtml(html) {
           : '';
       }
       if (!r.text) return '';
-      let t = escHtml(r.text);
-      if (r.i) t = '<i>' + t + '</i>';
-      if (r.b) t = '<b>' + t + '</b>';
-      return t;
+      return runHtml(r);
     }).join('');
     return inner.replace(/<[^>]+>/g, '').trim() ? '<p>' + inner + '</p>' : '';
   }).filter(Boolean);
@@ -3277,9 +3612,273 @@ function cleanPasteHtml(html) {
 }
 
 // Em dash, ellipsis, smart quotes:
+// Markdown emphasis, for writers whose fingers already know it: typing the
+// closing * of *word* sets it in italic, the closing ** of **word** in bold
+// (_word_ and __word__ too). Only in the manuscript and Notes, only when the
+// marks hug a word the way Markdown wants them to, so 2 * 3, f***, a lone
+// footnote * or a snake_case name stay as typed. ⌘Z right after gives the
+// marks back as plain characters.
+const escRe = (c) => c.replace(/\*/g, '\\*');
+// Which emphasis the typed mark closes, if any, from the paragraph's text
+// before the caret: ***word*** (bold italic), **word**, *word*. Nested
+// emphasis is fine: **a *b* c** and *a **b** c* both close.
+function mdEmphasisMatch(before, mark) {
+  const m = escRe(mark);
+  const edge = `(^|[^\\p{L}\\p{N}${m}\\\\])`;
+  const inner = `(?!\\s|${m})(.*?[^\\s\\\\])`;
+  const tries = [
+    { open: 3, part: 2, bold: true, italic: true },
+    { open: 2, part: 1, bold: true, italic: false },
+    { open: 1, part: 0, bold: false, italic: true }
+  ];
+  for (const t of tries) {
+    const r = before.match(new RegExp(`${edge}${m.repeat(t.open)}${inner}${m.repeat(t.part)}$`, 'u'));
+    // the inner text must not end on the mark itself (that is a longer mark
+    // still being typed), nor hold an emphasis opened but not yet closed
+    // (in *a **b the next * closes **b, not *a)
+    if (r && !r[2].endsWith(mark) && !(t.part === 0 && before.endsWith(mark)) && balancedRuns(r[2], mark)) {
+      return { ...t, inner: r[2], start: before.length - (r[0].length - r[1].length) };
+    }
+  }
+  return null;
+}
+function balancedRuns(text, mark) {
+  const counts = {};
+  for (const run of text.match(new RegExp(escRe(mark) + '+', 'g')) || []) counts[run.length] = (counts[run.length] || 0) + 1;
+  return Object.values(counts).every((n) => n % 2 === 0);
+}
+// character offset within el → a (text node, offset) point
+function pointAt(el, offset) {
+  const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let n; let left = offset; let last = null;
+  while ((n = walk.nextNode())) {
+    if (left <= n.textContent.length) return { node: n, offset: left };
+    left -= n.textContent.length;
+    last = n;
+  }
+  return last ? { node: last, offset: last.textContent.length } : { node: el, offset: 0 };
+}
+function selectChars(el, from, to) {
+  const a = pointAt(el, from); const b = pointAt(el, to);
+  const r = document.createRange();
+  r.setStart(a.node, a.offset);
+  r.setEnd(b.node, b.offset);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+let mdJustSet = null; // what was just turned into styling, for ⌘Z
+// ~~struck~~ as it's typed: the second closing ~ strikes the words through
+function markdownStrike(e, body, range) {
+  if (library && library.markdownOff) return false;
+  if (e.key !== '~' || !range.collapsed) return false;
+  if (!body.matches || !body.matches('.chapter-body, #aux-editor')) return false;
+  const start = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  const block = (start && start.closest('p, div, li')) || body;
+  if (!body.contains(block)) return false;
+  const pre = document.createRange();
+  pre.setStart(block, 0);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const before = pre.toString();
+  const m = before.match(/(^|[^~\\])~~(?![\s~])(.*?[^\s\\~])~$/u);
+  if (!m) return false;
+  e.preventDefault();
+  const end = before.length;
+  const at = end - m[0].length + m[1].length; // where the opening ~~ sits
+  let steps = 0;
+  selectChars(block, end - 1, end); document.execCommand('delete'); steps++;
+  selectChars(block, at, at + 2); document.execCommand('delete'); steps++;
+  const innerEnd = end - 3;
+  selectChars(block, at, innerEnd);
+  if (!document.queryCommandState('strikeThrough')) { document.execCommand('strikeThrough'); steps++; }
+  selectChars(block, innerEnd, innerEnd);
+  if (document.queryCommandState('strikeThrough')) document.execCommand('strikeThrough');
+  mdJustSet = { steps, key: e.key, block, end: innerEnd + 3 };
+  return true;
+}
+function markdownEmphasis(e, body, range) {
+  if (markdownStrike(e, body, range)) return true;
+  if (library && library.markdownOff) return false;
+  if (e.key !== '*' && e.key !== '_') return false;
+  if (!body.matches || !body.matches('.chapter-body, #aux-editor')) return false;
+  if (!range.collapsed) return false;
+  const start = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  const block = (start && start.closest('p, div, li')) || body;
+  if (!body.contains(block)) return false;
+  const pre = document.createRange();
+  pre.setStart(block, 0);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const before = pre.toString();
+  const hit = mdEmphasisMatch(before, e.key);
+  if (!hit) return false;
+  e.preventDefault();
+  let steps = 0;
+  const end = before.length;
+  // the part of the closing mark already typed, then the opening mark
+  if (hit.part) { selectChars(block, end - hit.part, end); document.execCommand('delete'); steps++; }
+  selectChars(block, hit.start, hit.start + hit.open);
+  document.execCommand('delete'); steps++;
+  // the words between them get the styling ⌘B and ⌘I give
+  const innerEnd = end - hit.part - hit.open;
+  const cmds = [hit.italic && 'italic', hit.bold && 'bold'].filter(Boolean);
+  for (const cmd of cmds) {
+    selectChars(block, hit.start, innerEnd);
+    if (!document.queryCommandState(cmd)) { document.execCommand(cmd); steps++; }
+  }
+  selectChars(block, innerEnd, innerEnd);
+  // what comes next is typed plain again
+  for (const cmd of cmds) if (document.queryCommandState(cmd)) document.execCommand(cmd);
+  mdJustSet = { steps, key: e.key, block, end };
+  return true;
+}
+// a key pressed on its own on the way to a shortcut
+const MODIFIER_KEYS = new Set(['Meta', 'Control', 'Shift', 'Alt', 'AltGraph', 'CapsLock', 'OS']);
+// A pasted line of Markdown as HTML with <b> and <i>, or null when it has
+// no emphasis (so ordinary text keeps pasting as text). Same rules as typing.
+function markdownInline(line) {
+  const edge = '(^|[^\\p{L}\\p{N}*_\\\\])';
+  const tail = '(?![\\p{L}\\p{N}])';
+  let html = escHtml(line);
+  const before = html;
+  html = html.replace(new RegExp(`${edge}(\\*\\*\\*|___)(?!\\s)(.+?)(?<![\\s\\\\])\\2${tail}`, 'gu'), '$1<b><i>$3</i></b>');
+  html = html.replace(new RegExp(`${edge}(\\*\\*|__)(?!\\s)(.+?)(?<![\\s\\\\])\\2${tail}`, 'gu'), '$1<b>$3</b>');
+  html = html.replace(new RegExp(`${edge}(\\*|_)(?![\\s*_])(.+?)(?<![\\s\\\\*_])\\2${tail}`, 'gu'), '$1<i>$3</i>');
+  html = html.replace(/(^|[^~\\])~~(?![\s~])(.+?)(?<![\s\\~])~~(?!~)/gu, '$1<s>$2</s>');
+  return html === before ? null : html;
+}
+// ⌘Z (Ctrl+Z) right after: the styling goes and the marks come back as typed
+document.addEventListener('keydown', (e) => {
+  if (MODIFIER_KEYS.has(e.key)) return; // the ⌘ or Ctrl of ⌘Z, on its way
+  const just = mdJustSet;
+  mdJustSet = null;
+  if (!just || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.code !== 'KeyZ') return;
+  e.preventDefault();
+  e.stopPropagation();
+  for (let i = 0; i < just.steps; i++) document.execCommand('undo');
+  // the text is back as it was typed; the mark that was about to close it goes in
+  if (just.block.isConnected) selectChars(just.block, just.end, just.end);
+  document.execCommand('insertText', false, just.key);
+}, true);
+
+// Dialogue dashes as you type (see dialogueDashEdits): a hyphen turns once
+// the key after it shows what it is. The key then goes on as usual, so a
+// quote after the dash still opens or closes. The opening dash is the
+// manuscript's only: Notes and Outline keep their "- " lists.
+let dashJustSet = null; // the dash just set, for ⌘Z
+function dialogueDashKey(e, body) {
+  if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || e.keyCode === 229) return;
+  const key = e.key === 'Enter' ? '' : e.key;
+  if (key.length > 1) return;
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  const range = sel.getRangeAt(0);
+  if (!range.collapsed) return;
+  const start = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  let block = start && start.closest('p, div, li');
+  if (!block || !body.contains(block)) block = body;
+  const pre = document.createRange();
+  pre.setStart(block, 0);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const before = pre.toString();
+  // the hyphen opening the paragraph, or the one just behind the caret
+  let from;
+  if (/^-\s*$/.test(before) && body.matches('.chapter-body')) from = 0;
+  else if (/\s-$/.test(before)) from = before.length - 2;
+  else return;
+  const edit = dialogueDashEdits(before.slice(from) + key, dashStyle(), { start: from === 0, end: !key })[0];
+  if (!edit) return;
+  const at = from + edit.at;
+  selectChars(block, at, at + edit.from.length);
+  document.execCommand('insertText', false, edit.to);
+  if (key) dashJustSet = { block, at, was: edit.from, to: edit.to, key };
+}
+// ⌘Z (Ctrl+Z) right after: the hyphen comes back as typed
+document.addEventListener('keydown', (e) => {
+  if (MODIFIER_KEYS.has(e.key)) return; // the ⌘ or Ctrl of ⌘Z, on its way
+  const just = dashJustSet;
+  dashJustSet = null;
+  if (!just || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.code !== 'KeyZ' || !just.block.isConnected) return;
+  e.preventDefault();
+  e.stopPropagation();
+  selectChars(just.block, just.at, just.at + just.to.length);
+  document.execCommand('insertText', false, just.was);
+  const caret = just.at + just.was.length + just.key.length;
+  selectChars(just.block, caret, caret);
+}, true);
+
+// Swap the last n typed characters for text. They are selected and typed
+// over, so the new text takes their styling: deleting them first leaves the
+// caret in whatever sits before them, and after an italic word the dash
+// (and everything typed after it) would come out italic.
+function replaceBefore(n, text) {
+  const sel = window.getSelection();
+  for (let i = 0; i < n; i++) sel.modify('extend', 'backward', 'character');
+  document.execCommand('insertText', false, text);
+}
+
+// Capitals as you type, in the manuscript: a sentence's first letter (at a
+// paragraph's start, or after a full stop that isn't an ellipsis or an
+// abbreviation; the same rules as capitalSlips) and, in English, "i" on its
+// own. ⌘Z (Ctrl+Z) right after keeps the lowercase. Poetry is left alone.
+let capJustSet = null; // the capital just set, for ⌘Z
+function autoCapKey(e, body) {
+  if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || e.keyCode === 229) return;
+  if (e.key.length !== 1 || !body.matches('.chapter-body')) return;
+  const sel = window.getSelection();
+  if (!sel.rangeCount || !sel.getRangeAt(0).collapsed) return;
+  const range = sel.getRangeAt(0);
+  const start = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
+  const block = start && start.closest('p');
+  if (!block || !body.contains(block) || block.matches('.poetry, .scene-break')) return;
+  const pre = document.createRange();
+  pre.setStart(block, 0);
+  pre.setEnd(range.startContainer, range.startOffset);
+  const before = pre.toString();
+  const lang = writingLanguage();
+  // a lowercase letter where a sentence starts
+  if (e.key !== e.key.toLocaleUpperCase(lang) && /\p{L}/u.test(e.key)) {
+    let starts = /^[\s"'“‘„«»(\[¿¡—–-]*$/.test(before);
+    if (!starts && /(?<!\.)\.\s+["'“‘„«(\[]?$/.test(before)) {
+      const word = (before.replace(/\.\s+["'“‘„«(\[]?$/, '.').match(/([\p{L}.]+)\.$/u) || [])[1] || '';
+      starts = !CAPS_ABBREV.has(word.toLowerCase()) && !/^\p{L}$/u.test(word);
+    }
+    if (!starts) return;
+    e.preventDefault();
+    const to = e.key.toLocaleUpperCase(lang);
+    document.execCommand('insertText', false, to);
+    capJustSet = { block, at: before.length, was: e.key, to, key: '' };
+    return;
+  }
+  // English: "i" standing alone becomes "I" once the next key shows it is
+  // a word (a space, punctuation, an apostrophe), and the key goes on as usual
+  if (/^en\b/.test(lang) && /^[\s,;:!?'’")”\]—–-]$/.test(e.key) && /(?:^|[^\p{L}\p{M}\d'’.(-])i$/u.test(before)) {
+    const at = before.length - 1;
+    selectChars(block, at, at + 1);
+    document.execCommand('insertText', false, 'I');
+    capJustSet = { block, at, was: 'i', to: 'I', key: e.key };
+  }
+}
+// ⌘Z (Ctrl+Z) right after: the lowercase comes back as typed
+document.addEventListener('keydown', (e) => {
+  if (MODIFIER_KEYS.has(e.key)) return; // the ⌘ or Ctrl of ⌘Z, on its way
+  const just = capJustSet;
+  capJustSet = null;
+  if (!just || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey || e.code !== 'KeyZ' || !just.block.isConnected) return;
+  e.preventDefault();
+  e.stopPropagation();
+  selectChars(just.block, just.at, just.at + 1);
+  document.execCommand('insertText', false, just.was);
+  // a key typed after the "i" stays, with the caret past it
+  const caret = just.at + 1 + just.key.length;
+  selectChars(just.block, caret, caret);
+}, true);
+
 function smartKeys(e, body) {
   // a field can reach smartKeys twice (its own handler and the page-wide
   // one below): the first pass wins
+  if (e.defaultPrevented) return;
+  dialogueDashKey(e, body);
+  autoCapKey(e, body);
   if (e.defaultPrevented) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.isComposing || e.keyCode === 229) return;
@@ -3295,17 +3894,15 @@ function smartKeys(e, body) {
     return node.textContent.slice(Math.max(0, range.startOffset - n), range.startOffset);
   };
 
+  if (markdownEmphasis(e, body, range)) return;
   if (e.key === '-' && prevChars(1) === '-') {
     e.preventDefault();
-    document.execCommand('delete');
-    document.execCommand('insertText', false, '—'); // —
+    replaceBefore(1, '—'); // —
     return;
   }
   if (e.key === '.' && prevChars(2) === '..') {
     e.preventDefault();
-    document.execCommand('delete');
-    document.execCommand('delete');
-    document.execCommand('insertText', false, '…'); // …
+    replaceBefore(2, '…'); // …
     return;
   }
   const french = frenchTypography();
@@ -3327,7 +3924,7 @@ function smartKeys(e, body) {
     let opening = before === '' || /[\s\(\[\{‘“«„>]/.test(before);
     // after a dash, a quote usually closes speech that was cut off ("I was
     // just—"); it opens one only when no quotation is open in the paragraph
-    if (before === '—' || before === '–') opening = !quoteIsOpen(range, e.key === '"' ? q : { open: '‘', close: '’' });
+    if (before === '—' || before === '–') opening = !quoteIsOpen(range, e.key === '"' ? q : { open: '‘', close: '’' }, e.key === '"' ? '"' : '');
     let ch;
     if (e.key === "'") {
       // most languages type ' as an apostrophe only; English and Dutch also
@@ -3340,28 +3937,35 @@ function smartKeys(e, body) {
   }
 }
 
-// Is a quotation open at the caret, in the paragraph so far? Opening marks
-// against closing ones; an apostrophe (’ between two letters) is no quote.
-function quoteIsOpen(range, q) {
+// Is a quotation open at the caret, in the paragraph so far?
+function quoteIsOpen(range, q, straight) {
   let el = range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.parentElement : range.startContainer;
   const block = el && el.closest ? el.closest('p, div') : null;
   if (!block) return false;
   const pre = document.createRange();
   pre.selectNodeContents(block);
   try { pre.setEnd(range.startContainer, range.startOffset); } catch { return false; }
-  const text = pre.toString();
+  return quoteOpenIn(pre.toString(), q, straight);
+}
+// The count itself: opening marks against closing ones; an apostrophe (’
+// between two letters) is no quote. Straight marks ("), which text imported
+// or pasted from a plain-text editor arrives with, have no side of their
+// own: they pair up in turn, so an odd one out is an open quotation.
+function quoteOpenIn(text, q, straight = '') {
   const open = q.open.trim();
   const close = q.close.trim();
   let depth = 0;
+  let straights = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (c === open && open !== close) depth++;
+    if (straight && c === straight) straights++;
+    else if (c === open && open !== close) depth++;
     else if (c === close) {
       if (close === '’' && /\p{L}/u.test(text[i - 1] || '') && /\p{L}/u.test(text[i + 1] || '')) continue;
       depth = Math.max(0, depth - 1);
     }
   }
-  return depth > 0;
+  return depth > 0 || straights % 2 === 1;
 }
 
 // The quotation marks of the language being written: the spellcheck
@@ -3377,7 +3981,8 @@ const QUOTE_STYLES = {
   de: { open: '„', close: '“' },
   pl: { open: '„', close: '”' },
   ro: { open: '„', close: '”' },
-  ru: { open: '«', close: '»' }
+  ru: { open: '«', close: '»' },
+  el: { open: '«', close: '»' }
 };
 function writingLanguage() {
   return (library && library.spellLanguage) || NeoI18n.getLocale();
@@ -3404,6 +4009,62 @@ function bookQuotes(el) {
   if (c['»'] > c.own && c['»'] >= c['«']) return { open: '»', close: '«' };
   if (c['«'] > c.own && c['«'] > c['»']) return { open: '«', close: '»' };
   return q;
+}
+
+// A hyphen standing on its own is a dash the keyboard didn't have. At the
+// start of a paragraph it opens speech, spaced the way the language sets
+// dialogue (— Olá, —Hola; elsewhere as typed). After a space, with a space,
+// a closing quote, punctuation or the paragraph's end behind it, it becomes
+// the language's dash and the spaces stay as typed. Hyphens in words
+// (guarda-chuva), suspended ones (pré- e pós-), and those before a digit
+// (-5) or a suffix (-mente) stay hyphens.
+const DIALOGUE_DASHES = {
+  pt: { open: '—', space: ' ', mid: '—' },   // — Olá — diz ela.
+  ru: { open: '—', space: ' ', mid: '—' },
+  es: { open: '—', space: '', mid: '—' },    // —Hola —dijo él—.
+  en: { open: '—', mid: '–' }                // and every other language: word – word
+};
+const DASH_OPEN = /^-(?:(\s+)(?=[^\s-])|(?=[^\s\d-]))/u;
+// (a quote typed right after the hyphen closes whatever comes next)
+const DASH_MID = /(?<=\s)-(?=["'“”‘’«»„]*(?:[\s.,;:!?…)\]]|$)|["'“”‘’«»„]+\uE000)/gu;
+// The changes, as { at, from, to }. start / end: whether the text begins or
+// ends its paragraph (a fragment pasted mid-sentence does neither); spaced:
+// whether a space comes before it.
+function dialogueDashEdits(text, style, { start = true, end = true, spaced = false } = {}) {
+  // a scene break, or a paragraph of nothing but dashes
+  if (start && end && /^[\s*#•~⁂—–-]*$/.test(text)) return [];
+  const edits = [];
+  const open = start && text.match(DASH_OPEN);
+  if (open) edits.push({ at: 0, from: open[0], to: style.open + (style.space !== undefined ? style.space : open[1] || '') });
+  // past the end of a fragment, anything could follow
+  const lead = !start && spaced ? ' ' : '';
+  const probe = lead + text + (end ? '' : '\uE000');
+  for (const m of probe.matchAll(DASH_MID)) edits.push({ at: m.index - lead.length, from: '-', to: style.mid });
+  return edits;
+}
+function dialogueDashes(text, style, edges) {
+  return dialogueDashEdits(text, style, edges).reduceRight(
+    (s, e) => s.slice(0, e.at) + e.to + s.slice(e.at + e.from.length), text);
+}
+// The same across a pasted paragraph's runs of bold and italic: each change
+// lands in the run that holds it
+function dashRuns(runs, style, edges) {
+  const texts = runs.filter((r) => r.mark === undefined);
+  const edits = dialogueDashEdits(texts.map((r) => r.text).join(''), style, edges);
+  for (const e of edits.reverse()) {
+    let pos = 0;
+    for (const r of texts) {
+      if (e.at >= pos && e.at + e.from.length <= pos + r.text.length) {
+        r.text = r.text.slice(0, e.at - pos) + e.to + r.text.slice(e.at - pos + e.from.length);
+        break;
+      }
+      pos += r.text.length;
+    }
+  }
+}
+function dashStyle() {
+  const code = writingLanguage();
+  return DIALOGUE_DASHES[code] || DIALOGUE_DASHES[code.split('-')[0]] || DIALOGUE_DASHES.en;
 }
 
 // French typographic rules apply when the book is spellchecked in French,
@@ -3448,6 +4109,32 @@ $('#tp-author').addEventListener('input', () => {
   scheduleMetaSave();
 });
 
+// Which logical shortcut a keyboard event means.
+//
+// Matched by the CHARACTER the key types, not the position it sits at: the help
+// overlay names characters (⌘/), and a character is what a menu accelerator can
+// name. A physical fallback catches the layouts where that character needs a
+// modifier the accelerator cannot spell — on Swiss German `/` is Shift+7 and
+// `;` is Shift+`,`, and on German `ö` sits on the `;` key — and every fallback
+// skips the character the menu already handles, so one press fires one action.
+function isSpellcheckShortcut(e) {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return false;
+  if (e.shiftKey && e.key === ';') return true;
+  return e.code === 'Semicolon' && e.key !== ';';
+}
+function isLargerTextShortcut(e) {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return false;
+  return e.key === '+' || e.key === '=' || e.code === 'NumpadAdd';
+}
+function isSmallerTextShortcut(e) {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return false;
+  return e.key === '-' || e.code === 'NumpadSubtract';
+}
+function isHelpShortcut(e) {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return false;
+  return e.key === '/' || e.key === '?';
+}
+
 // Global editor shortcuts
 document.addEventListener('keydown', (e) => {
   if ($('#editor-view').hidden) return;
@@ -3461,20 +4148,345 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     if (currentTab === 'manuscript') darlingFromKeyboard();
   }
-  // Ctrl+; is matched by the character, not the key position. On a German
-  // QWERTZ keyboard the semicolon is Shift+',' — a combination the menu
-  // accelerator cannot name, so Ctrl+; never fired there. Shift is required
-  // in this branch because the plain Ctrl+; case belongs to the menu on the
-  // layouts that have it; this catches the ones that need Shift to type ';'.
-  if (cmd && e.shiftKey && !e.altKey && e.key === ';') {
+  if (isSpellcheckShortcut(e)) {
     e.preventDefault();
     toggleSpellcheck();
+  }
+  // The text-size pair keeps the menu's own keys on the layouts where they
+  // match, and takes over by character where they do not (`+` is Shift+1 on
+  // Swiss German, so CmdOrCtrl-Plus never fires there).
+  if (isLargerTextShortcut(e)) {
+    e.preventDefault();
+    void setEditorFontSize(1);
+  }
+  if (isSmallerTextShortcut(e)) {
+    e.preventDefault();
+    void setEditorFontSize(-1);
   }
   if (e.key === 'Escape') {
     if (!$('#searchbar').hidden) closeSearch();
     else window.neo.fullscreenEscape().then((exited) => { if (!exited) backToShelf(); });
   }
 });
+
+// The help character works on every layout, editor or shelf: ⌘/ needs Shift+7
+// on Swiss German, which the bare-character accelerator cannot name, so the
+// renderer catches the character the layout produced.
+document.addEventListener('keydown', (e) => {
+  if (!isHelpShortcut(e)) return;
+  e.preventDefault();
+  showHelp();
+});
+
+// ⌥⌘↓ / ⌥⌘↑ (Ctrl+Alt on Windows and Linux): next or previous chapter.
+// No menu item carries these any more, so the window catches them itself —
+// first, before the page or the outline can read them as plain arrows.
+// Pocket takes both: a keyboard paired with a phone or an iPad may be a
+// Mac's (⌘ arrives as Meta) or a PC's (Ctrl).
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const cmd = IS_POCKET ? (e.metaKey !== e.ctrlKey) : (IS_MAC ? e.metaKey : e.ctrlKey);
+  if (!cmd || !e.altKey || e.shiftKey) return;
+  if ($('#editor-view').hidden || document.querySelector('.modal-backdrop:not([hidden])')) return;
+  e.preventDefault();
+  e.stopPropagation();
+  gotoChapter(e.key === 'ArrowDown' ? 1 : -1);
+}, true);
+
+/* ------------------------------------------------------------------ */
+/*  Vim keys (View → Vim Keys, off unless chosen)                      */
+/*                                                                      */
+/*  The small part of vim that writers use to move around a page. Esc   */
+/*  puts the page in moving mode (the caret turns gold); letters then   */
+/*  move instead of type, and i, a, o and friends go back to writing.   */
+/*  Esc while moving stays put, as in vim. Keys with ⌘ or Ctrl keep     */
+/*  their usual jobs, so none of NEO's shortcuts change.                */
+/*                                                                      */
+/*    h j k l   left, down, up, right      w b e   by word              */
+/*    0 ^ $     start / end of the line    ( )     by sentence          */
+/*    { }       by paragraph               gg G    top / end of chapter */
+/*    [[ ]]     previous / next chapter    Ctrl-d Ctrl-u  half a screen */
+/*    i a I A   write here / after / at the start / at the end of line   */
+/*    o O       new paragraph below / above                             */
+/*    v         select: motions stretch it, y copies, d or x cuts       */
+/*    x         delete the letter under the caret                       */
+/*    /         find                     a number first repeats: 3w     */
+/* ------------------------------------------------------------------ */
+let vimEnabled = false;
+let vimNav = false;        // moving, not typing
+let vimVisual = false;     // v: motions stretch the selection
+let vimCount = '';
+let vimPending = '';       // the g of gg, the [ of [[
+function applyVim() {
+  if (!vimEnabled) { vimNav = false; vimVisual = false; }
+  document.body.classList.toggle('vim-nav', vimNav);
+  if (window.neo.vimState) window.neo.vimState(vimEnabled); // the View menu's tick
+}
+function toggleVim() {
+  vimEnabled = !vimEnabled;
+  library.vimKeys = vimEnabled;
+  writeLibrary(library);
+  applyVim();
+  toast(vimEnabled ? t('Vim keys on — Esc to move, i to write') : t('Vim keys off'));
+}
+const vimEditor = (el) => el && el.closest && el.closest('.chapter-body, #aux-editor');
+function vimSetNav(on) {
+  vimNav = on;
+  vimVisual = false;
+  vimCount = '';
+  vimPending = '';
+  if (!on) { const s = window.getSelection(); if (s.rangeCount && !s.isCollapsed) s.collapseToEnd(); }
+  applyVim();
+}
+// the paragraph the caret is in, and the text on either side of it there
+function vimBlock() {
+  const s = window.getSelection();
+  if (!s.rangeCount) return null;
+  let n = s.focusNode;
+  if (n && n.nodeType === Node.TEXT_NODE) n = n.parentElement;
+  const p = n && n.closest && n.closest('p, li, div.chapter-body, #aux-editor');
+  return p || null;
+}
+function vimAround() {
+  const s = window.getSelection();
+  const block = vimBlock();
+  if (!block || !s.rangeCount) return { before: '', after: '' };
+  const r = document.createRange();
+  r.selectNodeContents(block);
+  const b = r.cloneRange();
+  b.setEnd(s.focusNode, s.focusOffset);
+  const a = r.cloneRange();
+  a.setStart(s.focusNode, s.focusOffset);
+  return { before: b.toString(), after: a.toString() };
+}
+const vimClass = (c) => (!c || /\s/.test(c) ? 0 : /[\p{L}\p{M}\p{N}_'’]/u.test(c) ? 1 : 2);
+function vimMove(dir, unit, times = 1) {
+  const s = window.getSelection();
+  for (let i = 0; i < times; i++) s.modify(vimVisual ? 'extend' : 'move', dir, unit);
+}
+// w, b, e as vim counts them: letters, then punctuation, are words; space isn't
+function vimWord(key) {
+  const { before, after } = vimAround();
+  const chars = [...(key === 'b' ? before : after)];
+  let n = 0;
+  if (key === 'w') {
+    const start = vimClass(chars[0]);
+    while (n < chars.length && start && vimClass(chars[n]) === start) n++;
+    while (n < chars.length && vimClass(chars[n]) === 0) n++;
+    if (n >= chars.length) { vimMove('forward', 'paragraphboundary'); vimMove('forward', 'character'); return; }
+  } else if (key === 'e') {
+    n = 1;
+    while (n < chars.length && vimClass(chars[n]) === 0) n++;
+    const cls = vimClass(chars[n]);
+    while (n + 1 < chars.length && vimClass(chars[n + 1]) === cls) n++;
+    if (n >= chars.length) { vimMove('forward', 'paragraphboundary'); return; }
+  } else {
+    chars.reverse();
+    while (n < chars.length && vimClass(chars[n]) === 0) n++;
+    const cls = vimClass(chars[n]);
+    while (n < chars.length && cls && vimClass(chars[n]) === cls) n++;
+    if (!chars.length) { vimMove('backward', 'character'); vimMove('backward', 'paragraphboundary'); return; }
+  }
+  vimMove(key === 'b' ? 'backward' : 'forward', 'character', n);
+}
+// a line or paragraph move that can't go further steps into the next chapter
+function vimLine(dir, unit) {
+  const s = window.getSelection();
+  const at = s.rangeCount ? [s.focusNode, s.focusOffset] : null;
+  vimMove(dir, unit);
+  if (vimVisual || !at || s.focusNode !== at[0] || s.focusOffset !== at[1]) return;
+  const ed = vimEditor(document.activeElement);
+  if (!ed || !ed.classList.contains('chapter-body')) return;
+  const order = book.chapterOrder;
+  const i = order.indexOf(currentChapterId) + (dir === 'forward' ? 1 : -1);
+  if (i < 0 || i >= order.length) return;
+  if (dir === 'forward') focusChapterStart(order[i]);
+  else {
+    const nb = document.querySelector(`.chapter[data-id="${order[i]}"] .chapter-body`);
+    if (!nb || !nb.isContentEditable) return;
+    nb.focus({ preventScroll: true });
+    const r = document.createRange();
+    r.selectNodeContents(nb);
+    r.collapse(false);
+    s.removeAllRanges();
+    s.addRange(r);
+    currentChapterId = order[i];
+    highlightNav();
+  }
+  revealCaret();
+}
+// vim's selections take in the letter under the caret, too
+function vimInclusive() {
+  const s = window.getSelection();
+  if (!s.rangeCount || s.isCollapsed) return;
+  const r = document.createRange();
+  r.setStart(s.anchorNode, s.anchorOffset);
+  r.setEnd(s.focusNode, s.focusOffset);
+  if (!r.collapsed) s.modify('extend', 'forward', 'character'); // anchor first: a forward selection
+}
+function vimHalfPage(dir) {
+  const sc = $('#paper-scroll');
+  if (!sc || currentTab !== 'manuscript') return;
+  const box = sc.getBoundingClientRect();
+  sc.scrollTop += dir * sc.clientHeight / 2;
+  // the caret follows to the same place on the screen
+  const r = document.caretRangeFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+  const ed = r && vimEditor(r.startContainer.nodeType === Node.TEXT_NODE ? r.startContainer.parentElement : r.startContainer);
+  if (!ed) return;
+  ed.focus({ preventScroll: true });
+  const s = window.getSelection();
+  s.removeAllRanges();
+  s.addRange(r);
+}
+// Moving, a key counts by where it sits on the keyboard, named as on a US
+// one, whatever layout is on: on Russian or Greek the key under the right
+// index finger is still j, and Shift+4 is still $. A dead key, and a key an
+// input method takes (Process), count by their place too.
+const VIM_US = {
+  Space: [' ', ' '], Minus: ['-', '_'], Equal: ['=', '+'], BracketLeft: ['[', '{'], BracketRight: [']', '}'],
+  Backslash: ['\\', '|'], Semicolon: [';', ':'], Quote: ["'", '"'], Backquote: ['`', '~'],
+  Comma: [',', '<'], Period: ['.', '>'], Slash: ['/', '?']
+};
+for (const c of 'abcdefghijklmnopqrstuvwxyz') VIM_US['Key' + c.toUpperCase()] = [c, c.toUpperCase()];
+[...')!@#$%^&*('].forEach((shifted, d) => { VIM_US['Digit' + d] = [String(d), shifted]; });
+function vimKeyOf(e) {
+  const us = VIM_US[e.code];
+  if (!us || (e.key.length > 1 && e.key !== 'Dead' && e.key !== 'Process')) return e.key;
+  const caps = /^Key/.test(e.code) && e.getModifierState('CapsLock');
+  return us[e.shiftKey !== caps ? 1 : 0];
+}
+function vimKey(e) {
+  const k = vimKeyOf(e);
+  // counts: 3w, 12j (a 0 on its own is the start of the line)
+  if (/^[0-9]$/.test(k) && (k !== '0' || vimCount)) { vimCount += k; return; }
+  const times = Math.max(1, Math.min(999, parseInt(vimCount || '1', 10)));
+  vimCount = '';
+  const pending = vimPending;
+  vimPending = '';
+  if (pending === 'g') { if (k === 'g') vimMove('backward', 'documentboundary'); revealCaret(); return; }
+  if (pending === '[' || pending === ']') {
+    if (k === pending) gotoChapter(k === ']' ? times : -times);
+    return;
+  }
+  const back = 'backward', fwd = 'forward';
+  switch (k) {
+    case 'h': case 'Backspace': vimMove(back, 'character', times); break;
+    case 'l': case ' ': vimMove(fwd, 'character', times); break;
+    case 'j': case 'Enter': for (let i = 0; i < times; i++) vimLine(fwd, 'line'); break;
+    case 'k': for (let i = 0; i < times; i++) vimLine(back, 'line'); break;
+    case 'w': case 'b': case 'e': for (let i = 0; i < times; i++) vimWord(k); break;
+    case '0': case '^': vimMove(back, 'lineboundary'); break;
+    case '$': vimMove(fwd, 'lineboundary'); break;
+    case '(': vimMove(back, 'sentence', times); break;
+    case ')': vimMove(fwd, 'sentence', times); break;
+    case '{': for (let i = 0; i < times; i++) vimLine(back, 'paragraph'); break;
+    case '}': for (let i = 0; i < times; i++) vimLine(fwd, 'paragraph'); break;
+    case 'G': vimMove(fwd, 'documentboundary'); break;
+    case 'g': case '[': case ']': vimPending = k; return;
+    case 'v': {
+      vimVisual = !vimVisual;
+      if (!vimVisual) window.getSelection().collapseToEnd();
+      break;
+    }
+    case 'y':
+      if (vimVisual) { vimInclusive(); document.execCommand('copy'); vimVisual = false; window.getSelection().collapseToStart(); }
+      break;
+    case 'd': case 'x': case 'Delete':
+      if (vimVisual) { vimInclusive(); document.execCommand('cut'); vimVisual = false; }
+      else if (k !== 'd') for (let i = 0; i < times; i++) document.execCommand('forwardDelete');
+      break;
+    case 'i': vimSetNav(false); break;
+    case 'a': vimSetNav(false); vimMove(fwd, 'character'); break;
+    case 'I': vimSetNav(false); vimMove(back, 'lineboundary'); break;
+    case 'A': vimSetNav(false); vimMove(fwd, 'lineboundary'); break;
+    case 'o': vimSetNav(false); vimMove(fwd, 'paragraphboundary'); document.execCommand('insertParagraph'); break;
+    case 'O':
+      vimSetNav(false);
+      vimMove(back, 'paragraphboundary');
+      document.execCommand('insertParagraph');
+      vimMove(back, 'character');
+      break;
+    case '/': vimSetNav(false); openSearch(); return;
+    default: return;
+  }
+  revealCaret();
+}
+// first in line for keys in the page and the notes, ahead of NEO's own
+// typing rules, and only while vim keys are on
+window.addEventListener('keydown', (e) => {
+  if (!vimEnabled) return;
+  const ed = vimEditor(e.target);
+  if (!ed) { if (vimNav) vimSetNav(false); return; }
+  if (document.querySelector('.modal-backdrop:not([hidden])')) return;
+  if (!vimNav) {
+    if (e.isComposing || e.keyCode === 229) return; // an input method's, while writing
+    // Esc while writing: start moving
+    if (e.key === 'Escape' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      vimSetNav(true);
+    }
+    return;
+  }
+  if (e.key === 'Escape') {
+    // vim hands press Esc out of habit: here it only lets go of a selection
+    // or a half-typed command, and never sends the book back to the shelf
+    e.preventDefault();
+    e.stopPropagation();
+    if (vimVisual) window.getSelection().collapseToEnd();
+    vimVisual = false;
+    vimCount = '';
+    vimPending = '';
+    return;
+  }
+  const k = vimKeyOf(e);
+  // Ctrl-d / Ctrl-u move half a screen; other modified keys keep their jobs
+  if (e.ctrlKey && !e.metaKey && !e.altKey && (k === 'd' || k === 'u')) {
+    e.preventDefault();
+    e.stopPropagation();
+    vimHalfPage(k === 'd' ? 1 : -1);
+    return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey || e.getModifierState('AltGraph')) return;
+  // arrows, Home, End, Page Up and Down still move as they always do
+  if (k.length > 1 && k !== 'Enter' && k !== 'Backspace' && k !== 'Delete' && k !== 'Tab') return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (ed.classList.contains('chapter-body')) typewriterByKeyboard = true; // typewriter scrolling follows
+  vimKey(e);
+}, true);
+// a click into the page, or the window losing focus, leaves the mode as it was;
+// leaving the page for a title or the notes' own fields lets it go
+document.addEventListener('focusin', (e) => {
+  if (vimNav && !vimEditor(e.target)) vimSetNav(false);
+});
+// Moving, nothing a keyboard types lands in the text. What ⌥ or AltGr makes
+// is refused. A dead key or an input method reaches the page after the
+// system has begun composing with it, which can't be refused, so the
+// composition is ended as soon as it starts (moving the focus away and
+// back commits it and resets the composer), and its text comes back out.
+document.addEventListener('beforeinput', (e) => {
+  if (vimNav && vimEditor(e.target) && e.inputType === 'insertText') e.preventDefault();
+}, true);
+document.addEventListener('compositionstart', (e) => {
+  const ed = vimNav && vimEditor(e.target);
+  const s = window.getSelection();
+  if (!ed || !s.rangeCount) return;
+  const at = s.getRangeAt(0).cloneRange();
+  const before = ed.innerHTML;
+  // setting the selection ends the engine's typing run, so the composed
+  // text is an undo step of its own and not part of the last x
+  s.removeAllRanges();
+  s.addRange(at);
+  setTimeout(() => {
+    if (document.activeElement !== ed) return;
+    ed.blur();
+    ed.focus({ preventScroll: true });
+    if (ed.innerHTML !== before) document.execCommand('undo');
+    s.removeAllRanges();
+    s.addRange(at);
+  }, 0);
+}, true);
 
 // Escape also exits regular fullscreen from the bookshelf
 document.addEventListener('keydown', (e) => {
@@ -3810,12 +4822,20 @@ function renderNav() {
     rowEl.addEventListener('dragend', finishChapterDrag);
     // right-click: what it is, or Delete
     item.addEventListener('contextmenu', (e) => {
+      if (IS_POCKET) { e.preventDefault(); return; } // on a phone this pane is for hopping
       if (e.target.closest('.nav-note[contenteditable="true"]')) return; // the note's own text menu
       e.preventDefault();
       chapterMenu(chId, e.clientX, e.clientY, rowEl);
     });
 
-    if (story) {
+    if (story && IS_POCKET) {
+      // on a phone this pane is for hopping: a tap anywhere on the box
+      // goes there. The note is read here and written in the Outline.
+      const note = document.createElement('div');
+      note.className = 'nav-note nav-note-ro';
+      note.textContent = book.chapterNotes[chId] || '';
+      item.appendChild(note);
+    } else if (story) {
       // outline your whole book from this panel:
       const note = document.createElement('div');
       note.className = 'nav-note';
@@ -3846,6 +4866,14 @@ function renderNav() {
 
     item.onclick = () => {
       switchTab('manuscript');
+      if (IS_POCKET) {
+        // the top of the chapter, and the pane steps aside for the page
+        const sec = document.querySelector(`.chapter[data-id="${chId}"]`);
+        focusChapterStart(chId);
+        if (sec) sec.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
+        if ($('#nav-pane').dataset.pinned !== '1') $('#nav-pane').classList.remove('open');
+        return;
+      }
       focusChapter(chId);
     };
     // from the keyboard, the row is the chapter's button (F6 reaches the pane)
@@ -3911,12 +4939,11 @@ function bookContents(meta = book) {
     if (kind === 'part') inPart = true;
     else if (BACK_KINDS.includes(kind)) inPart = false;
     if (['copyright', 'dedication', 'epigraph', 'contents'].includes(kind) || chId === solo) continue;
-    let label = chapterName(chId, meta);
-    const title = STORY_KINDS.includes(kind) ? ((meta.chapterTitles || {})[chId] || '') : '';
+    let label = STORY_KINDS.includes(kind) ? chapterHeading(chId, meta) || chapterName(chId, meta) : chapterName(chId, meta);
     if (kind === 'part') {
       const partTitle = partTitleOf(chId);
       if (partTitle) label += ': ' + partTitle;
-    } else if (title) label = library.exportCustomChapterTitles && kind === 'chapter' ? title : label + ' — ' + title;
+    }
     out.push({ chId, label, type: kind === 'part' ? 'part' : STORY_KINDS.includes(kind) ? 'chapter' : 'page', level: inPart && kind !== 'part' ? 1 : 0 });
   }
   return out;
@@ -4238,6 +5265,7 @@ async function moveSelectionToDarlings(html, text) {
   const did = 'd-' + Date.now().toString(36);
 
   snapshotStructure('darling');
+  breakRun++; // the engine never saw this cut: ⌘Z inside the text must reach the structural stack
 
   let anchorPrefix = null;
   let anchorSuffix = null;
@@ -4426,6 +5454,16 @@ function switchTab(name) {
 
 const secLetter = (i) => String.fromCharCode(65 + (i % 26));
 
+/**
+ * Where the caret goes after a section is removed from the outline: the end of the section ABOVE it,
+ * the way a text editor behaves. Only the first section has no line above it, and then the chapter's
+ * own line is where the caret belongs.
+ */
+function focusAfterSectionRemoved(list, index, chId) {
+  const above = index > 0 ? list[index - 1] : undefined;
+  return above ? { secId: above.id } : { chId };
+}
+
 function renderOutline(focusTarget) {
   book.sectionNotes = book.sectionNotes || {};
   book.chapterNotes = book.chapterNotes || {};
@@ -4605,11 +5643,12 @@ function outlineLine(kind, chId, secId, index, label, text) {
     if (e.key === 'Backspace' && txt.textContent.trim() === '') {
       e.preventDefault();
       if (kind === 'section') {
-        const list = book.sectionNotes[chId];
+        const list = book.sectionNotes[chId] || [];
+        const focus = focusAfterSectionRemoved(list, index, chId);
         book.sectionNotes[chId] = list.filter((s) => s.id !== secId);
         scheduleMetaSave();
         syncGhosts(chId);
-        renderOutline({ chId });
+        renderOutline(focus);
       } else if (book.chapterOrder.filter((c) => isStory(c)).length > 1 && countWords(chapterText(chId)) === 0) {
         const prevCh = storyBefore(chId) || book.chapterOrder.find((c) => c !== chId && isStory(c));
         deleteChapterQuiet(chId).then(() => renderOutline({ chId: prevCh }));
@@ -4627,10 +5666,12 @@ function outlineLine(kind, chId, secId, index, label, text) {
       const choice = await optionModal(t('Delete this section?'), null,
         [{ label: t('Delete section'), desc: t('Removes the outline line and its gray ghost from the manuscript. Written prose is never touched.'), danger: true, value: 'delete' }]);
       if (choice === 'delete') {
-        book.sectionNotes[chId] = (book.sectionNotes[chId] || []).filter((s) => s.id !== secId);
+        const list = book.sectionNotes[chId] || [];
+        const focus = focusAfterSectionRemoved(list, index, chId);
+        book.sectionNotes[chId] = list.filter((s) => s.id !== secId);
         scheduleMetaSave();
         syncGhosts(chId);
-        renderOutline({ chId });
+        renderOutline(focus);
       }
     }
   });
@@ -4834,13 +5875,15 @@ function updateCounters() {
       : t('ch. {ch}: {n} words', { ch: cur ? chapterNumber(cur) : 0, n });
   }
   const pos = $('#pos-counter');
-  pos.textContent = !cur
+  pos.textContent = library.posMode === 'page'
+    ? (cur ? t('page {p} of {total}', { p: currentPage(cur), total: pageCount(total) }) : t('{n} pages', { n: pageCount(total) }))
+    : !cur
     ? (numberedChapters() > 1 ? t('{n} chapters', { n: numberedChapters() }) : '')
     : cur === solo
       ? '' // a chapterless story needs no chapter locator
       : chapterKind(cur) !== 'chapter'
         ? chapterName(cur)
-        : t('chapter {ch} of {total}', { ch: chapterNumber(cur), total: numberedChapters() });
+        : t('chapter {ch} of {total}', { ch: chapterNumber(cur), total: numberedChapters(book, cur) });
   // cache for the bookshelf progress bar
   if (book.wordCount !== total) {
     // only a true crossing earns a painting — a story that was already long
@@ -4875,6 +5918,15 @@ function trackDailyWords(total) {
   } else if (book.dailyCounts[today].end !== total) {
     book.dailyCounts[today].end = total;
   }
+  // Cutting is writing too: words cut below where the day began move the
+  // day's start down with them, so today never reads below zero, and what's
+  // written after the cut counts in full. (Cut what you wrote today, and
+  // today is smaller: that part is honest.)
+  if (total < book.dailyCounts[today].start) {
+    book.dailyCounts[today].start = total;
+    scheduleMetaSave();
+  }
+  if (sprint && total < sprint.startCount) sprint.startCount = total;
   const wordsToday = book.dailyCounts[today].end - book.dailyCounts[today].start;
   const gc = $('#goal-counter');
   if (sprint && !sprint.done) {
@@ -4893,6 +5945,33 @@ function trackDailyWords(total) {
   }
 }
 
+// Pages, the way a manuscript counts them: 250 words to a page. The page
+// the caret is on counts the story's words before it.
+const WORDS_PER_PAGE = 250;
+const pageCount = (words) => Math.max(1, Math.ceil(words / WORDS_PER_PAGE));
+function currentPage(cur) {
+  let before = 0;
+  for (const chId of book.chapterOrder) {
+    if (chId === cur) break;
+    if (isStory(chId)) before += chapterWords(chId);
+  }
+  const sel = window.getSelection();
+  const body = document.querySelector(`.chapter[data-id="${cur}"] .chapter-body`);
+  if (isStory(cur) && body && sel.rangeCount && body.contains(sel.anchorNode)) {
+    const r = document.createRange();
+    r.selectNodeContents(body);
+    r.setEnd(sel.anchorNode, sel.anchorOffset);
+    before += countWords(plainText(r.cloneContents()));
+  }
+  return Math.min(pageCount(bookWordCount()), Math.floor(before / WORDS_PER_PAGE) + 1);
+}
+// click: chapter of chapters ↔ page of pages
+$('#pos-counter').onclick = () => {
+  library.posMode = library.posMode === 'page' ? 'chapter' : 'page';
+  writeLibrary(library);
+  updateCounters();
+};
+
 $('#word-counter').onclick = () => {
   wordMode = wordMode === 'book' ? 'chapter' : 'book';
   updateCounters();
@@ -4901,6 +5980,9 @@ $('#word-counter').onclick = () => {
 // select a passage → the counter reports its size
 document.addEventListener('selectionchange', () => {
   if (!book || currentTab !== 'manuscript') return;
+  // the recount a click asked for would cover the count of the word a
+  // double click goes on to select
+  clearTimeout(saveTimers.selcount);
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) {
     let el = sel.anchorNode;
@@ -4913,7 +5995,6 @@ document.addEventListener('selectionchange', () => {
       }
     }
   }
-  clearTimeout(saveTimers.selcount);
   saveTimers.selcount = setTimeout(() => { if (book) updateCounters(); }, 150);
 });
 
@@ -4998,13 +6079,25 @@ async function saveMeta() {
   savedMetaSig = sig;
 }
 
-function flushAllSaves() {
+function flushAllSaves(e) {
   if (!book) return;
-  // remember where you were for next session
-  const pos = { chapterId: currentChapterId, scroll: $('#paper-scroll').scrollTop };
-  const moved = !book.lastPosition || book.lastPosition.chapterId !== pos.chapterId ||
-    Math.abs((book.lastPosition.scroll || 0) - pos.scroll) > 40;
-  book.lastPosition = pos;
+  // remember where you were, for next session and for the other device:
+  // the chapter, the paragraph and the letter (the same place on any
+  // screen) plus the scroll (this screen's). `at` changes only when the
+  // caret does, so a device that merely scrolled never calls the other
+  // one back to an old spot.
+  const prev = book.lastPosition || {};
+  const caret = captureCaret();
+  const spot = caret
+    ? { chapterId: caret.chId, pIdx: caret.pIdx, off: caret.off }
+    : prev.chapterId === currentChapterId ? { chapterId: prev.chapterId, pIdx: prev.pIdx, off: prev.off } : { chapterId: currentChapterId };
+  const scroll = $('#paper-scroll').scrollTop;
+  const newSpot = spot.chapterId !== prev.chapterId || spot.pIdx !== prev.pIdx;
+  const newLetter = newSpot || spot.off !== prev.off;
+  // the regular tick while writing saves a new paragraph; leaving NEO (a
+  // blur, the app going to the background, closing) saves the exact letter
+  const moved = newSpot || (e !== 'tick' && newLetter) || Math.abs((prev.scroll || 0) - scroll) > 40;
+  if (moved) book.lastPosition = { ...spot, scroll, at: newLetter ? Date.now() : (prev.at || Date.now()) };
   for (const chId of book.chapterOrder) {
     if (chapterHTML[chId] !== undefined && chapterHTML[chId] !== savedHTML[chId]) {
       persistChapter(chId);
@@ -5217,6 +6310,21 @@ async function refreshFromDisk() {
       else if (replaced.length) toast(t('Updated from your other device — the text it replaced is in Darlings'), 8000);
       else toast(t('Updated from your other device'));
     }
+
+    // The writer moved on to the other device since last touching this one:
+    // the caret goes where they left off there. (Its chapter's words may
+    // still be crossing over; the spot waits a little for its paragraph.)
+    const there = meta.lastPosition;
+    const here = book.lastPosition || {};
+    if (there && typeof there.at === 'number' && there.at > (here.at || 0) && there.at > lastHereActivity &&
+        currentTab === 'manuscript' && !document.querySelector('.modal-backdrop:not([hidden])') &&
+        book.chapterOrder.includes(there.chapterId)) {
+      const body = document.querySelector(`.chapter[data-id="${there.chapterId}"] .chapter-body`);
+      const arrived = body && (typeof there.pIdx !== 'number' || body.querySelectorAll('p').length > there.pIdx);
+      if ((arrived || Date.now() - there.at > 120000) && resumePosition(there)) {
+        book.lastPosition = { ...there, scroll: $('#paper-scroll').scrollTop };
+      }
+    }
   } catch (err) {
     console.error(err);
   } finally {
@@ -5235,9 +6343,10 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', flushAllSaves);
 // flush whenever focus leaves NEO, and every 20 seconds
 window.addEventListener('blur', () => { if (book) flushAllSaves(); });
-setInterval(() => { if (book) flushAllSaves(); }, 20000);
+setInterval(() => { if (book) flushAllSaves('tick'); }, 20000);
 
 async function backToShelf() {
+  if (reading) stopReadAloud(false);
   flushAllSaves();
   tabPlaces = {};
   book = null;
@@ -5323,6 +6432,44 @@ function restoreCaret(caret) {
   finish();
 }
 
+// Back where the writer left off, on this device or the other one: the caret
+// at its letter, a third of the way down the window. A position from an
+// older NEO (the scroll alone) gets the scroll.
+function resumePosition(pos) {
+  if (!book || !pos || !book.chapterOrder.includes(pos.chapterId)) return false;
+  const body = document.querySelector(`.chapter[data-id="${pos.chapterId}"] .chapter-body`);
+  if (!body) return false;
+  const sc = $('#paper-scroll');
+  if (typeof pos.pIdx !== 'number' || !body.isContentEditable) {
+    currentChapterId = pos.chapterId;
+    sc.scrollTop = pos.scroll || 0;
+  } else {
+    restoreCaret({ chId: pos.chapterId, pIdx: pos.pIdx, off: pos.off || 0 });
+    const sel = window.getSelection();
+    if (sel.rangeCount) {
+      const r = sel.getRangeAt(0).cloneRange();
+      let rect = r.getBoundingClientRect();
+      if (!rect.height) {
+        const node = r.startContainer.nodeType === Node.ELEMENT_NODE ? r.startContainer : r.startContainer.parentElement;
+        if (node) rect = node.getBoundingClientRect();
+      }
+      sc.scrollTop += rect.top - sc.getBoundingClientRect().top - sc.clientHeight / 3;
+    }
+  }
+  highlightNav();
+  updateCounters();
+  return true;
+}
+
+// When this device last did something to the page: a key, or a tap or click
+// in the manuscript. A newer spot from the other device moves the caret only
+// if it is newer than that (a scroll or a glance doesn't count).
+let lastHereActivity = 0;
+document.addEventListener('keydown', () => { lastHereActivity = Date.now(); }, true);
+document.addEventListener('pointerdown', (e) => {
+  if (e.target && e.target.closest && e.target.closest('#chapters')) lastHereActivity = Date.now();
+}, true);
+
 // The engine's undo history must never replay against a document NEO has
 // rearranged by hand — clear it whenever such a rearrangement happens.
 function resetNativeUndo() {
@@ -5396,6 +6543,7 @@ function rejoinAtCaret() {
   if (!prev || prev.tagName !== 'P') return;
   if (prev.classList.contains('scene-break') || blk.classList.contains('scene-break')) return;
   if (prev.classList.contains('poetry') !== blk.classList.contains('poetry')) return;
+  if (prev.classList.contains('flush') !== blk.classList.contains('flush')) return;
   const chId = body.closest('.chapter').dataset.id;
   const at = prev.textContent.length;
   if (blk.textContent.trim() === '') {
@@ -5441,6 +6589,177 @@ document.addEventListener('keydown', (e) => {
   e.preventDefault();
   structuralUndo();
 });
+
+/* ================================================================== */
+/*  READ ALOUD — ⌘⇧U (Ctrl+Shift+U)                                    */
+/*  The computer's own voice reads from the caret, a sentence at a      */
+/*  time, each one lit as it's read, on into the chapters after. ⌘⇧U   */
+/*  again, Esc or a keystroke stops it, and the caret is left at the    */
+/*  sentence it reached, so ⌘⇧U carries on from there. No keys, no      */
+/*  cloud: the voices that come with macOS and Windows.                 */
+/* ================================================================== */
+
+let reading = null; // { item, gen } while the voice is going
+let readGen = 0;
+
+function readVoice() {
+  const voices = window.speechSynthesis.getVoices();
+  const lang = writingLanguage().toLowerCase();
+  const base = lang.split('-')[0];
+  const by = (f) => voices.find(f);
+  return by((v) => v.lang.toLowerCase().replace('_', '-') === lang && v.default) ||
+    by((v) => v.lang.toLowerCase().replace('_', '-') === lang) ||
+    by((v) => v.lang.toLowerCase().startsWith(base) && v.localService) ||
+    by((v) => v.lang.toLowerCase().startsWith(base)) ||
+    by((v) => v.default) || voices[0] || null;
+}
+async function readVoicesReady() {
+  if (window.speechSynthesis.getVoices().length) return true;
+  await new Promise((resolve) => {
+    const done = () => resolve();
+    window.speechSynthesis.addEventListener('voiceschanged', done, { once: true });
+    setTimeout(done, 1500);
+  });
+  return window.speechSynthesis.getVoices().length > 0;
+}
+
+// The paragraphs to read, from one, in order: the rest of its editor, then
+// (in the manuscript) the chapters after it
+function readParasFrom(p) {
+  const out = [];
+  const editor = p.closest('.chapter-body, #aux-editor');
+  const ok = (q) => q.tagName === 'P' && !q.classList.contains('scene-break') && !q.classList.contains('ghost');
+  const take = (root, from) => {
+    let on = !from;
+    for (const q of root.querySelectorAll('p')) {
+      if (q === from) on = true;
+      if (on && ok(q)) out.push(q);
+    }
+  };
+  take(editor, p);
+  if (editor.matches('.chapter-body')) {
+    const bodies = [...document.querySelectorAll('#chapters .chapter-body')];
+    for (const b of bodies.slice(bodies.indexOf(editor) + 1)) take(b, null);
+  }
+  return out;
+}
+// a paragraph's sentences, as character spans of its text, from an offset
+function readSentences(p, from) {
+  const text = p.textContent;
+  const spans = [];
+  if (window.Intl && Intl.Segmenter) {
+    const seg = new Intl.Segmenter(writingLanguage(), { granularity: 'sentence' });
+    for (const s of seg.segment(text)) spans.push([s.index, s.index + s.segment.length]);
+  } else spans.push([0, text.length]);
+  return spans
+    .map(([a, b]) => [Math.max(a, from), b])
+    .filter(([a, b]) => b > a && text.slice(a, b).trim());
+}
+function readRange(p, a, b) {
+  const s = pointAt(p, a), e = pointAt(p, b);
+  if (!s || !e) return null;
+  const r = document.createRange();
+  r.setStart(s.node, s.offset);
+  r.setEnd(e.node, e.offset);
+  return r;
+}
+
+async function toggleReadAloud() {
+  if (reading) { stopReadAloud(true); return; }
+  if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) { toast(t('Read aloud needs a voice on this computer')); return; }
+  const sel = window.getSelection();
+  let el = sel.rangeCount ? sel.anchorNode : null;
+  if (el && el.nodeType === Node.TEXT_NODE) el = el.parentElement;
+  let p = el && el.closest ? el.closest('.chapter-body p, #aux-editor p') : null;
+  let from = 0;
+  if (p) {
+    const pre = document.createRange();
+    pre.selectNodeContents(p);
+    pre.setEnd(sel.anchorNode, sel.anchorOffset);
+    from = pre.toString().length;
+  } else {
+    // no caret in the text: from the top of the chapter on screen
+    const body = currentTab === 'manuscript'
+      ? document.querySelector(`.chapter[data-id="${currentChapterId || (book && book.chapterOrder[0])}"] .chapter-body`)
+      : $('#aux-editor');
+    p = body && body.querySelector('p');
+  }
+  if (!p) return;
+  if (!(await readVoicesReady())) { toast(t('Read aloud needs a voice on this computer')); return; }
+  const paras = readParasFrom(p);
+  // start at the beginning of the sentence the caret is in
+  const first = readSentences(p, 0).find(([a, b]) => from >= a && from < b);
+  if (first) from = first[0];
+  const gen = ++readGen;
+  reading = { gen, item: null };
+  const queue = function* () {
+    for (const [n, q] of paras.entries()) {
+      for (const [a, b] of readSentences(q, n === 0 && q === p ? from : 0)) yield { p: q, a, b };
+    }
+  }();
+  const voice = readVoice();
+  const next = () => {
+    if (!reading || reading.gen !== gen) return;
+    const { value: item, done } = queue.next();
+    if (done || !item.p.isConnected) { stopReadAloud(false); return; }
+    reading.item = item;
+    const u = new SpeechSynthesisUtterance(item.p.textContent.slice(item.a, item.b).trim());
+    if (voice) { u.voice = voice; u.lang = voice.lang; } else u.lang = writingLanguage();
+    u.onstart = () => {
+      if (!reading || reading.gen !== gen) return;
+      const r = readRange(item.p, item.a, item.b);
+      if (!r || !window.Highlight || !CSS.highlights) return;
+      CSS.highlights.set('neo-speak', new Highlight(r));
+      // keep the sentence on screen
+      const sc = $('#paper-scroll');
+      const box = r.getBoundingClientRect();
+      const view = sc.getBoundingClientRect();
+      if (box.top < view.top + 40 || box.bottom > view.bottom - 60) {
+        sc.scrollTop += box.top - view.top - view.height / 3;
+      }
+    };
+    u.onend = () => next();
+    u.onerror = (ev) => { if (ev.error !== 'interrupted' && ev.error !== 'canceled') stopReadAloud(false); };
+    window.speechSynthesis.speak(u);
+  };
+  window.speechSynthesis.cancel();
+  next();
+}
+// leaveCaret: the writer stopped it, so the caret goes to the sentence reached
+function stopReadAloud(leaveCaret) {
+  const was = reading;
+  reading = null;
+  readGen++;
+  try { window.speechSynthesis.cancel(); } catch { /* nothing speaking */ }
+  if (window.CSS && CSS.highlights) CSS.highlights.delete('neo-speak');
+  if (leaveCaret && was && was.item && was.item.p.isConnected) {
+    const ed = was.item.p.closest('.chapter-body, #aux-editor');
+    const pt = pointAt(was.item.p, was.item.a);
+    if (ed && pt) {
+      ed.focus({ preventScroll: true });
+      const s = window.getSelection();
+      s.removeAllRanges();
+      const r = document.createRange();
+      r.setStart(pt.node, pt.offset);
+      r.collapse(true);
+      s.addRange(r);
+    }
+  }
+}
+document.addEventListener('keydown', (e) => {
+  const cmd = e.metaKey || e.ctrlKey;
+  if (cmd && e.shiftKey && !e.altKey && e.code === 'KeyU') {
+    if (!book || $('#editor-view').hidden) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toggleReadAloud();
+    return;
+  }
+  if (!reading || MODIFIER_KEYS.has(e.key)) return;
+  // Esc stops the voice and nothing else; any other key stops it and goes on
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); }
+  stopReadAloud(e.key === 'Escape');
+}, true);
 
 /* ================================================================== */
 /*  FIND & REPLACE                                                     */
@@ -5651,7 +6970,8 @@ async function addImportedBooks(results, shelf) {
       const chId = 'ch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
       const html = ch.paras.map((p) => {
         if (p.scene) return '<p class="scene-break">***</p>';
-        let text = escHtml(p.text || '');
+        // hyphens set as dialogue dashes, the same as typing them
+        let text = escHtml(dialogueDashes(p.text || '', dashStyle()));
         text = text.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
                    .replace(/\*([^*]+)\*/g, '<i>$1</i>')
                    .replace(/_([^_]+)_/g, '<i>$1</i>');
@@ -5707,8 +7027,16 @@ async function spellScanEl(el, key) {
   const occurrences = [];
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   // letters of any alphabet, with their accents, so French and German
-  // words reach the dictionary whole
-  const re = /[\p{L}\p{M}'’]+/gu;
+  // words reach the dictionary whole — hyphenated ones too (e-mail,
+  // well-known, fazê-lo, dir-se-ia): the dictionary judges the whole word,
+  // and only when it says no are the pieces underlined one by one
+  const re = /[\p{L}\p{M}'’]+(?:-[\p{L}\p{M}'’]+)*/gu;
+  const piece = /[\p{L}\p{M}'’]+/gu;
+  const legal = (raw) => /^[\p{Lu}'’]+$/u.test(raw); // acronyms and shouting are legal
+  // a stammer (E-eu, N-não, Wh-what): each short piece starts the next, and
+  // only the word it lands on is judged
+  const bare = (s) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+  const stammers = (bits) => bits.length > 1 && bits.slice(0, -1).every((s, i) => s.length <= 3 && bare(bits[i + 1]).startsWith(bare(s)));
   let n;
   while ((n = walker.nextNode())) {
     const p = n.parentElement;
@@ -5716,30 +7044,111 @@ async function spellScanEl(el, key) {
     let m;
     re.lastIndex = 0;
     while ((m = re.exec(n.data))) {
-      const word = spellNorm(m[0]);
-      if (word.length < 2) continue;
-      if (/^[\p{Lu}'’]+$/u.test(m[0])) continue; // acronyms and shouting are legal
-      occurrences.push({ node: n, start: m.index, end: m.index + m[0].length, word });
+      const stammer = stammers(m[0].split('-'));
+      const parts = [];
+      piece.lastIndex = 0;
+      let q;
+      while ((q = piece.exec(m[0]))) {
+        const word = spellNorm(q[0]);
+        if (word.length < 2 || legal(q[0])) continue;
+        if (stammer && q.index + q[0].length < m[0].length) continue;
+        parts.push({ start: m.index + q.index, end: m.index + q.index + q[0].length, word });
+      }
+      if (!parts.length) continue;
+      const whole = m[0].includes('-') && !stammer && !legal(m[0].replace(/-/g, '')) ? spellNorm(m[0]) : null;
+      occurrences.push({ node: n, start: m.index, end: m.index + m[0].length, whole, parts });
     }
   }
-  const unknown = [...new Set(occurrences.map((o) => o.word))].filter((w) => !spellCache.has(w));
+  const words = new Set();
+  for (const o of occurrences) {
+    if (o.whole) words.add(o.whole);
+    for (const pt of o.parts) words.add(pt.word);
+  }
+  const unknown = [...words].filter((w) => !spellCache.has(w));
   if (unknown.length) {
     const res = await window.neo.spellCheckWords(unknown);
     for (const w of unknown) spellCache.set(w, res[w] !== false);
   }
   if (!spellOn) return; // toggled off while we were checking
   const ranges = [];
-  for (const o of occurrences) {
-    if (spellCache.get(o.word) || !o.node.isConnected) continue;
+  const mark = (node, start, end) => {
     try {
       const r = new Range();
-      r.setStart(o.node, o.start);
-      r.setEnd(o.node, o.end);
+      r.setStart(node, start);
+      r.setEnd(node, end);
       ranges.push(r);
     } catch { /* node changed underneath us */ }
+  };
+  for (const o of occurrences) {
+    if (!o.node.isConnected) continue;
+    if (o.whole && spellCache.get(o.whole)) continue;
+    const wrong = o.parts.filter((pt) => !spellCache.get(pt.word));
+    if (wrong.length) for (const pt of wrong) mark(o.node, pt.start, pt.end);
+    else if (o.whole) mark(o.node, o.start, o.end); // every piece fine, the whole not
   }
+  const caps = capitalSlips(el);
+  for (const r of caps) ranges.push(r);
+  capsRanges.set(key, caps);
   spellRanges.set(key, ranges);
   rebuildSpellHighlight();
+}
+
+// Capitals the dictionary can't see, since it takes any word in lowercase:
+// a sentence that starts small, and, in English, "i" for "I". Underlined
+// like a misspelling; right-click offers the capital. Manuscript prose only
+// (notes are the writer's scratch paper, and poetry sets its own case).
+// Mid-paragraph, only a full stop ends a sentence: "Oh! how lovely",
+// "— Quanto falta? — perguntou ele" and "…and then" are the writer's.
+const capsRanges = new Map(); // key → [Range]
+const CAPS_ABBREV = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'vs', 'etc', 'e.g', 'i.e', 'cf', 'approx', 'no', 'vol', 'pp', 'p', 'fig', 'ca', 'mt', 'ft', 'lt', 'sgt', 'capt', 'col', 'gen', 'prof', 'rev', 'hon', 'inc', 'ltd', 'co', 'ave', 'a.m', 'p.m', 'sra', 'sr', 'srta', 'dra', 'av', 'ex', 'z.b', 'bzw', 'ggf', 'usw', 'm', 'mme', 'mlle']);
+function capitalSlips(el) {
+  const out = [];
+  if (typeof el.matches !== 'function' || !el.matches('.chapter-body')) return out;
+  const english = /^en\b/.test(writingLanguage());
+  for (const p of el.querySelectorAll('p:not(.poetry):not(.scene-break)')) {
+    // the paragraph's text, and which node holds each stretch of it
+    const segs = [];
+    let text = '';
+    const w = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = w.nextNode())) {
+      if (n.parentElement && n.parentElement.closest('.ghost, .ph-mark')) continue;
+      segs.push({ node: n, at: text.length });
+      text += n.data;
+    }
+    if (!text.trim()) continue;
+    const seen = new Set();
+    const mark = (i) => {
+      if (seen.has(i)) return;
+      seen.add(i);
+      let s = segs[0];
+      for (const g of segs) if (g.at <= i) s = g; else break;
+      try {
+        const r = new Range();
+        r.setStart(s.node, i - s.at);
+        r.setEnd(s.node, i - s.at + 1);
+        out.push(r);
+      } catch { /* changed underneath us */ }
+    };
+    // the paragraph's first letter, past opening quotes, brackets and dashes
+    const lead = text.match(/^[\s"'“‘„«»(\[¿¡—–-]*/)[0].length;
+    if (/\p{Ll}/u.test(text[lead] || '') && !/^\p{Ll}\./u.test(text.slice(lead, lead + 2))) mark(lead);
+    // a letter after a full stop (not an ellipsis or an abbreviation)
+    const stop = /(?<!\.)\.\s+["'“‘„«(\[]?(\p{Ll})/gu;
+    let m;
+    while ((m = stop.exec(text))) {
+      const before = text.slice(0, m.index).match(/([\p{L}.]+)$/u);
+      const word = before ? before[1].toLowerCase() : '';
+      if (CAPS_ABBREV.has(word) || /^\p{L}$/u.test(word)) continue; // Mr. smith, J. r. r.
+      mark(m.index + m[0].length - 1);
+    }
+    // English "i", "i'm", "i'd" … standing alone (not "i.e." or "(i)")
+    if (english) {
+      const eye = /(?<![\p{L}\p{M}\d'’.(-])i(?![\p{L}\p{M}\d.)-])(?!['’](?![mdv]|ll|re))/gu;
+      while ((m = eye.exec(text))) mark(m.index);
+    }
+  }
+  return out;
 }
 
 function rebuildSpellHighlight() {
@@ -5774,10 +7183,12 @@ function toggleSpellcheck() {
   if (spellOn) {
     spellScanned = new Set();
     spellRanges = new Map();
+    capsRanges.clear();
     scanSpellingHere();
   } else {
     CSS.highlights.delete('neo-spell');
     spellRanges = new Map();
+    capsRanges.clear();
     document.querySelector('.spell-menu')?.remove();
   }
   toast(spellOn ? t('Spellcheck on') : t('Spellcheck off'));
@@ -5788,7 +7199,7 @@ function toggleSpellcheck() {
 const SPELL_LANGUAGE_NAMES = {
   'en-US': t('US English'), 'en-GB': t('UK English'), 'en-CA': t('Canadian English'),
   'en-AU': t('Australian English'), fr: t('French'), es: t('Spanish'), de: t('German'),
-  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': 'Português (Brasil)', ro: t('Romanian'), ru: t('Russian')
+  nl: t('Dutch'), pl: t('Polish'), 'pt-BR': t('Brazilian Portuguese'), ro: t('Romanian'), ru: t('Russian')
 };
 async function changeSpellLanguage(code) {
   const ok = await window.neo.setSpellLanguage(code);
@@ -5799,6 +7210,7 @@ async function changeSpellLanguage(code) {
   if (spellOn) {
     spellScanned = new Set();
     spellRanges = new Map();
+    capsRanges.clear();
     CSS.highlights.delete('neo-spell');
     scanSpellingHere();
   }
@@ -5814,13 +7226,45 @@ document.addEventListener('contextmenu', async (e) => {
   if (!pos || pos.startContainer.nodeType !== Node.TEXT_NODE) return;
   const node = pos.startContainer;
   const text = node.data;
+  // a capital slip (see capitalSlips): the letter's capital, and nothing to learn
+  let ws = pos.startOffset;
+  while (ws > 0 && /[\p{L}\p{M}]/u.test(text[ws - 1])) ws--;
+  for (const list of capsRanges.values()) {
+    const hit = list.find((r) => r.startContainer === node && r.startOffset === ws);
+    if (!hit) continue;
+    e.preventDefault();
+    const at = hit.startOffset;
+    const upper = text[at].toLocaleUpperCase(writingLanguage());
+    const chEl = editor.closest('.chapter');
+    showSpellMenu(e.clientX, e.clientY, text[at], [upper], {
+      replace: (s) => {
+        const sel = window.getSelection();
+        const r = document.createRange();
+        r.setStart(node, at); r.setEnd(node, at + 1);
+        sel.removeAllRanges(); sel.addRange(r);
+        document.execCommand('insertText', false, s);
+        if (chEl) spellScanEl(spellElFor(chEl.dataset.id), chEl.dataset.id);
+      }
+    });
+    return;
+  }
   const isW = (c) => /[\p{L}\p{M}'’]/u.test(c);
   let a = pos.startOffset, b = pos.startOffset;
   while (a > 0 && isW(text[a - 1])) a--;
   while (b < text.length && isW(text[b])) b++;
   if (a === b) return;
-  const word = spellNorm(text.slice(a, b));
-  if (spellCache.get(word) !== false) return; // only flagged words get our menu
+  let word = spellNorm(text.slice(a, b));
+  if (spellCache.get(word) !== false) {
+    // …or a hyphenated word underlined whole: every piece is a word, the
+    // whole isn't (see spellScanEl)
+    let wa = a, wb = b;
+    while (text[wa - 1] === '-' && isW(text[wa - 2] || '')) { wa--; while (wa > 0 && isW(text[wa - 1])) wa--; }
+    while (text[wb] === '-' && isW(text[wb + 1] || '')) { wb++; while (wb < text.length && isW(text[wb])) wb++; }
+    const whole = spellNorm(text.slice(wa, wb));
+    if (whole === word || spellCache.get(whole) !== false) return; // only flagged words get our menu
+    if (text.slice(wa, wb).split('-').some((w) => spellCache.get(spellNorm(w)) === false)) return;
+    a = wa; b = wb; word = whole;
+  }
   e.preventDefault();
   const chEl = editor.closest ? editor.closest('.chapter') : null;
   const key = editor.id === 'aux-editor'
@@ -5867,13 +7311,15 @@ function showSpellMenu(x, y, word, suggestions, actions) {
     none.disabled = true;
     menu.appendChild(none);
   }
-  const sep = document.createElement('div');
-  sep.className = 'sm-sep';
-  menu.appendChild(sep);
-  const learn = document.createElement('button');
-  learn.textContent = t('Add “{word}” to dictionary', { word });
-  learn.onclick = () => { menu.remove(); actions.learn(); };
-  menu.appendChild(learn);
+  if (actions.learn) {
+    const sep = document.createElement('div');
+    sep.className = 'sm-sep';
+    menu.appendChild(sep);
+    const learn = document.createElement('button');
+    learn.textContent = t('Add “{word}” to dictionary', { word });
+    learn.onclick = () => { menu.remove(); actions.learn(); };
+    menu.appendChild(learn);
+  }
   document.body.appendChild(menu);
   const r = menu.getBoundingClientRect();
   menu.style.left = Math.min(x, window.innerWidth - r.width - 10) + 'px';
@@ -6062,7 +7508,7 @@ function updateFocus() {
   // on its chapter body (a class on the body itself is never saved)
   document.querySelectorAll('.chapter-body.focus-cap').forEach((b) => b.classList.remove('focus-cap'));
   const body = p.parentElement;
-  const first = body.querySelector('p:not(.poetry)'); // the drop cap skips poetry paragraphs
+  const first = body.querySelector('p[data-first]'); // the paragraph with the drop cap (openingPara)
   const firstText = first && document.createTreeWalker(first, NodeFilter.SHOW_TEXT).nextNode();
   if (r && firstText && r.comparePoint(firstText, 0) === 0) body.classList.add('focus-cap');
 }
@@ -6251,7 +7697,7 @@ function hourLabel(h) {
 function openStats() {
   const hasBook = !!book;
   const today = hasBook ? (book.dailyCounts || {})[todayStr()] : null;
-  const wordsToday = today ? today.end - today.start : 0;
+  const wordsToday = today ? Math.max(0, today.end - today.start) : 0;
   const total = hasBook ? bookWordCount() : 0;
   const bd = document.createElement('div');
   bd.className = 'modal-backdrop';
@@ -6277,9 +7723,9 @@ function openStats() {
         </label>
       </div>
       ${hasBook ? `
-      <div class="stats-row">
+      <div class="stats-row stats-goals">
         <label>${t('Sprint')} <input id="st-sprint" type="number" min="50" value="${sprint ? sprint.target : 500}"/> ${t('words')}</label>
-        <button id="st-sprint-btn" class="btn-gold">${sprint && !sprint.done ? t('End sprint') : t('Start sprint')}</button>
+        <button id="st-sprint-btn" class="btn-gold" style="align-self: center;">${sprint && !sprint.done ? t('End sprint') : t('Start sprint')}</button>
       </div>` : ''}
       <div style="text-align:right;margin-top:14px">
         <button class="m-ok btn-gold">${t('Done')}</button>
@@ -6340,15 +7786,17 @@ const BODY_FONTS = {
   'Cambria': 'Cambria, Georgia, serif',
   'Constantia': 'Constantia, Georgia, serif',
   // a sans-serif for those who write in one (bundled, so it's the same everywhere)
-  'Jost': '"Jost", "Avenir Next", "Helvetica Neue", Arial, sans-serif'
+  'Jost': '"Jost", "Avenir Next", "Helvetica Neue", Arial, sans-serif',
+  // iA Writer's own face, bundled too (SIL Open Font License)
+  'iA Writer Quattro': '"iA Writer Quattro", "Helvetica Neue", Arial, sans-serif'
 };
 
 // Hoefler Text and Iowan Old Style ship only with macOS; elsewhere they
 // would fall back to Georgia, so offer the fonts Windows actually has.
 // Keep in step with bodyFonts in main.js.
 const BODY_FONT_CHOICES = IS_MAC
-  ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost']
-  : ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost'];
+  ? ['Georgia', 'Palatino', 'Baskerville', 'Hoefler Text', 'Iowan Old Style', 'Jost', 'iA Writer Quattro']
+  : ['Georgia', 'Palatino', 'Baskerville', 'Cambria', 'Constantia', 'Jost', 'iA Writer Quattro'];
 
 function applyFonts() {
   const f = library.fonts || {};
@@ -6435,7 +7883,7 @@ async function pickLocalFont() {
     input.oninput = render;
     input.onkeydown = (e) => {
       if (e.key === 'Enter' && list.firstChild) done(list.firstChild.textContent);
-      if (e.key === 'Escape') done(null);
+      if (e.key === 'Escape') { e.stopPropagation(); done(null); } // as in askInput
     };
     bd.querySelector('.m-cancel').onclick = () => done(null);
     render();
@@ -6542,34 +7990,30 @@ function shortcutSections() {
     { title: tk('Writing'), rows: [
       [tk('Enter ×2'), tk('Insert a section break')],
       [tk('Enter ×3'), tk('Start a new chapter')],
-      [K('⇧Enter', 'Shift+Enter'), tk('Start or continue a poetry paragraph'), tk('Also works from a chapter heading.')],
+      [K('⇧Enter', 'Shift+Enter'), tk('A paragraph with no indent'), tk('Again for another; Enter goes back to prose.')],
+      [K('⌘⇧Enter', 'Ctrl+Shift+Enter'), tk('Start or continue a poetry paragraph'), tk('Also works from a chapter heading.')],
       [KPH, tk('Insert a placeholder note')],
-      [KDA, tk('Move selected text to Darlings')]
+      [KDA, tk('Move selected text to Darlings')],
+      [K('⌘⇧U', 'Ctrl+Shift+U'), tk('Read aloud from the cursor'), tk('Again, Esc or any key stops it. Uses your computer’s own voice.')]
     ] },
     { title: tk('Formatting'), rows: [
-      [K('⌘B', 'Ctrl+B'), tk('Bold')],
-      [K('⌘I', 'Ctrl+I'), tk('Italic')],
+      [['*…*', '**…**', '***…***'], tk('Italic, bold, the Markdown way'), tk('Typed around a word (or pasted). Undo right after keeps the asterisks. Format → Markdown Emphasis turns it off.')],
+      [K('⌘U', 'Ctrl+U'), tk('Underline')],
+      [K('⌘⇧S', 'Ctrl+Shift+S'), tk('Strikethrough'), tk('Or ~~…~~ around the words.')],
       [K('⌘⇧L', 'Ctrl+Shift+L'), tk('Align paragraph left')],
       [K('⌘⇧C', 'Ctrl+Shift+C'), tk('Center paragraph')],
       [K('⌘⇧R', 'Ctrl+Shift+R'), tk('Align paragraph right')],
       [K('⌘⇧J', 'Ctrl+Shift+J'), tk('Justify paragraph')],
       [K('⌘+', 'Ctrl++'), tk('Larger text')],
       [K('⌘−', 'Ctrl+−'), tk('Smaller text')],
-      [K('⌘0', 'Ctrl+0'), tk('Reset text size and page zoom')],
-      [K(tk('⌃Scroll'), tk('Ctrl+Scroll')), tk('Zoom the page')]
+      [K('⌘0', 'Ctrl+0'), tk('Reset text size and page zoom')]
     ] },
     { title: tk('Outline'), rows: [
       ['Tab', tk('Turn a chapter into a section'), tk('Only empty chapters after the first chapter.')],
       [K('⇧Tab', 'Shift+Tab'), tk('Turn a section into a chapter')]
     ] },
     { title: tk('Editing'), rows: [
-      [KZ, tk('Undo'), tk('Also undoes recent chapter changes, Darlings moves and Replace All.')],
-      [K('⌘⇧Z', /win/i.test(navigator.platform) ? 'Ctrl+Y' : 'Ctrl+Shift+Z'), tk('Redo')],
-      [K('⌘X', 'Ctrl+X'), tk('Cut')],
-      [K('⌘C', 'Ctrl+C'), tk('Copy')],
-      [K('⌘V', 'Ctrl+V'), tk('Paste')],
       [K('⌘⌥⇧V', 'Ctrl+Shift+V'), tk('Paste and match style')],
-      [K('⌘A', 'Ctrl+A'), tk('Select all')],
       [K('⌘F', 'Ctrl+F'), tk('Find and replace')],
       [K('⌘;', 'Ctrl+;'), tk('Toggle spellcheck pass')]
     ] },
@@ -6585,15 +8029,29 @@ function shortcutSections() {
       [K('⌘⇧O', 'Ctrl+Shift+O'), tk('Cycle focus mode'), tk('Off → paragraph → sentence → off.')],
       [K('⌥⌘↓', 'Ctrl+Alt+↓'), tk('Go to the next chapter')],
       [K('⌥⌘↑', 'Ctrl+Alt+↑'), tk('Go to the previous chapter')],
-      [K('⌘M', 'Ctrl+M'), tk('Minimize window')],
-      [K('⌘W', 'Ctrl+W'), tk('Close window')],
       [['F6', K('⌃Tab', 'Ctrl+Tab')], tk('Move between the page, the chapters, the notes and the bottom bar'), tk('Add Shift to go back. Esc returns to the page. On the shelf: the books, then the header.')],
       ...(IS_MAC ? [
         ['⌘H', tk('Hide NEO')],
         ['⌘⌥H', tk('Hide other apps')]
-      ] : []),
-      ...(!/win/i.test(navigator.platform) ? [[K('⌘Q', 'Ctrl+Q'), tk('Quit NEO')]] : [])
-    ] }
+      ] : [])
+    ] },
+    // only for writers who turned them on (View → Vim Keys)
+    ...(vimEnabled ? [{ title: tk('Vim keys'), rows: [
+      ['Esc', tk('Stop writing and move around the page'), tk('i, a or o goes back to writing.')],
+      ['h j k l', tk('Left, down, up, right')],
+      ['w b e', tk('Next word, previous word, end of word')],
+      ['0 $', tk('Start or end of the line')],
+      ['( )', tk('Previous or next sentence')],
+      ['{ }', tk('Previous or next paragraph')],
+      ['gg G', tk('Top or end of the chapter')],
+      ['[[ ]]', tk('Previous or next chapter')],
+      [K('⌃d ⌃u', 'Ctrl+d Ctrl+u'), tk('Down or up half a screen')],
+      ['i a I A', tk('Write here, after, at the start or end of the line')],
+      ['o O', tk('Write in a new paragraph below or above')],
+      ['v', tk('Select'), tk('Move to stretch it, then y to copy or d to cut.')],
+      ['x', tk('Delete the letter under the caret')],
+      ['/', tk('Find')]
+    ] }] : [])
   ];
 }
 
@@ -6628,9 +8086,10 @@ function showHelp() {
         <dd>${[keys].flat().map((key) => t(key)).map((key) => `<kbd aria-label="${escHtml(keyName(key))}">${escHtml(key)}</kbd>`).join(`<span class="shortcut-or">${t('or')}</span>`)}</dd>
       </div>`).join('')}</dl></section>`);
   // Keep Writing and Formatting first, with similar amounts of content per column.
+  // Vim keys, there only while they're on, runs across both below them.
   content.innerHTML = [[0, 2, 4, 5], [1, 3]].map((column) => `<div class="shortcuts-column">${
     column.map((index) => sections[index]).join('')
-  }</div>`).join('');
+  }</div>`).join('') + (sections[6] ? `<div class="shortcuts-wide">${sections[6]}</div>` : '');
   const close = () => {
     document.removeEventListener('keydown', handleKeyDown, true);
     bd.remove();
@@ -6684,21 +8143,18 @@ function parasFromHtml(html) {
   return [...holder.querySelectorAll('p')].map((p) => {
     const sceneBreak = p.classList.contains('scene-break');
     const poetry = p.classList.contains('poetry');
+    const flush = !poetry && p.classList.contains('flush');
     const align = (p.style && p.style.textAlign) || '';
     const runs = paraRuns(p.innerHTML, true).filter((r) => r.text);
-    const inner = runs.map((r) => {
-      let t = escHtml(r.text);
-      if (r.i) t = '<i>' + t + '</i>';
-      if (r.b) t = '<b>' + t + '</b>';
-      return t;
-    }).join('');
+    const inner = runs.map((r) => runHtml(r)).join('');
     return {
       sceneBreak,
       poetry,
+      flush,
       text: p.innerText.replace(/\u00a0/g, ' ').trim(),
       runs,
       align,
-      html: `<p${poetry ? ' class="poetry"' : ''}${align ? ` style="text-align:${align}"` : ''}>${inner}</p>`
+      html: `<p${poetry ? ' class="poetry"' : flush ? ' class="flush"' : ''}${align ? ` style="text-align:${align}"` : ''}>${inner}</p>`
     };
   }).filter((p) => p.sceneBreak || p.text);
 }
@@ -6744,14 +8200,9 @@ function exportChapters() {
       continue;
     }
     // the story: chapterless stories export as continuous text
-    const chTitle = (book.chapterTitles || {})[chId];
-    const heading = chId === solo
-      ? ''
-      : library.exportCustomChapterTitles && chTitle
-        ? chTitle
-        : chapterName(chId) + (chTitle ? ' — ' + chTitle : '');
+    const heading = chId === solo ? '' : chapterHeading(chId);
     const level = inPart ? 1 : 0;
-    const sec = push({ kind: 'chapter', heading, paras, role: chapterRole(chId) || '', level });
+    const sec = push({ kind: 'chapter', heading, paras, role: chapterRole(chId) || '', level, chId });
     toc.push({ label: heading || book.title, num: sec.num, level, type: 'chapter' });
   }
   if (contentsAt >= 0) sections.forEach((sec, i) => { sec.front = i < contentsAt; });
@@ -6787,6 +8238,23 @@ function bookExportData() {
   };
 }
 
+// One chapter, on its own: the book's title page, then that chapter, headed
+// as it is in the book (Chapter 7 — Holston). No cover image in a web page
+// or PDF; an EPUB keeps the book's cover, since e-readers expect one.
+function chapterExportData(chId) {
+  const d = bookExportData();
+  const sec = d.sections.find((s) => s.kind === 'chapter' && s.chId === chId);
+  if (!sec) return null;
+  Object.assign(sec, { num: 1, level: 0, front: false });
+  return {
+    ...d,
+    sections: [sec],
+    toc: [{ label: sec.heading || d.title, num: 1, level: 0, type: 'chapter' }],
+    contents: false,
+    chapterOnly: sec.heading || chapterName(chId)
+  };
+}
+
 // a heading as plain text: a part's name with its title
 const plainHeading = (ch) => (ch.partTitle ? `${ch.heading}: ${ch.partTitle}` : ch.heading);
 
@@ -6809,13 +8277,17 @@ function buildMd(data) {
   const mdMeta = (s) => String(s || '').replace(/([\\`*_\[\]#<>])/g, '\\$1');
   // wrap a run in emphasis markers, keeping boundary spaces outside them
   const mdRun = (r) => {
-    let t = r.text.replace(/([\\*_`])/g, '\\$1');
+    let t = r.text.replace(/([\\*_`~])/g, '\\$1');
     const mark = r.b && r.i ? '***' : r.b ? '**' : r.i ? '*' : '';
-    if (!mark) return t;
+    if (!mark && !r.s && !r.u) return t;
     const lead = t.match(/^\s*/)[0];
     const trail = t.match(/\s*$/)[0];
-    const core = t.slice(lead.length, t.length - trail.length);
-    return core ? lead + mark + core + mark + trail : t;
+    let core = t.slice(lead.length, t.length - trail.length);
+    if (!core) return t;
+    // Markdown has strikethrough; underline goes as HTML, which it allows
+    if (r.s) core = '~~' + core + '~~';
+    if (r.u) core = '<u>' + core + '</u>';
+    return lead + mark + core + mark + trail;
   };
   let out = `# ${mdMeta(d.title)}\n\n`;
   if (d.subtitle) out += `*${mdMeta(d.subtitle)}*\n\n`;
@@ -6834,8 +8306,13 @@ function buildMd(data) {
 // inside the file, so the PDF matches the page on any machine; a font the
 // computer has goes by name, with the same fallbacks as the page.
 const exportBodyFont = () => (getComputedStyle(document.documentElement).getPropertyValue('--body-font').trim() || 'Georgia, serif').replace(/[<>{};]/g, '');
+// the drop cap too: its face is the page's, bundled or the computer's
+const exportDropCapFont = () => (getComputedStyle(document.documentElement).getPropertyValue('--dropcap-font').trim() || 'Georgia, serif').replace(/[<>{};]/g, '');
+const firstFamily = (stack) => stack.split(',')[0].trim().replace(/^["']|["']$/g, '');
 async function exportFontFaces(d) {
-  const family = exportBodyFont().split(',')[0].trim().replace(/^["']|["']$/g, '');
+  const family = firstFamily(exportBodyFont());
+  // the drop cap sets one letter, upright and regular
+  const cap = (library.fonts || {}).dropcap === 'none' ? '' : firstFamily(exportDropCapFont());
   const text = d.sections.map((ch) => ch.paras.map((p) => p.html).join('')).join('');
   // (the title is always bold; a dedication, an epigraph, a part's lines
   // and a title's subtitle are set in italic)
@@ -6848,18 +8325,24 @@ async function exportFontFaces(d) {
     try { rules = [...sheet.cssRules]; } catch { continue; }
     for (const r of rules) {
       if (!(r instanceof CSSFontFaceRule)) continue;
-      if (r.style.getPropertyValue('font-family').replace(/["']/g, '').trim() !== family) continue;
+      const name = r.style.getPropertyValue('font-family').replace(/["']/g, '').trim();
       const style = r.style.getPropertyValue('font-style') || 'normal';
       const weight = r.style.getPropertyValue('font-weight') || '400';
-      if (style === 'italic' && !(parseInt(weight, 10) >= 600 ? boldItalic : italic)) continue;
+      const forBody = name === family && !(style === 'italic' && !(parseInt(weight, 10) >= 600 ? boldItalic : italic));
+      const forCap = name === cap && style === 'normal' && parseInt(weight, 10) === 400;
+      if (!forBody && !forCap) continue;
       const src = r.style.getPropertyValue('src').match(/url\(["']?([^"')]+)["']?\)\s*(format\([^)]*\))?/);
       if (!src) continue;
+      // a Russian face keeps its range and its measures, or it would stand
+      // in for the Latin one at the Latin one's size
+      const fit = ['unicode-range', 'size-adjust', 'ascent-override', 'descent-override', 'line-gap-override']
+        .map((k) => r.style.getPropertyValue(k) && ` ${k}: ${r.style.getPropertyValue(k)};`).filter(Boolean).join('');
       try {
         const bytes = new Uint8Array(await (await fetch(new URL(src[1], sheet.href || location.href))).arrayBuffer());
         let bin = '';
         for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
         const ext = src[1].split('.').pop().toLowerCase();
-        css += `@font-face { font-family: '${family}'; src: url(data:font/${ext};base64,${btoa(bin)}) ${src[2] || ''}; font-weight: ${weight}; font-style: ${style}; }\n`;
+        css += `@font-face { font-family: '${name}'; src: url(data:font/${ext};base64,${btoa(bin)}) ${src[2] || ''}; font-weight: ${weight}; font-style: ${style};${fit} }\n`;
       } catch { /* the name still stands, with its fallbacks */ }
     }
   }
@@ -6882,19 +8365,22 @@ function buildHtml(data, opts = {}) {
   // scene breaks resume ordinary body text
   const prose = (paras, initial) => {
     let first = initial;
+    let afterBreak = false; // a story's line of speech after *** keeps its indent
     return paras.map((p) => {
-      if (p.sceneBreak) return '<p class="brk">***</p>';
-      if (p.poetry) return p.html;
+      if (p.sceneBreak) { afterBreak = initial; return '<p class="brk">***</p>'; }
+      if (p.poetry) { afterBreak = false; return p.html; }
       let html = p.html;
-      if (first) {
+      if (first || afterBreak) {
         const h = document.createElement('div');
         h.innerHTML = html;
         if (h.firstElementChild) {
-          h.firstElementChild.classList.add('first');
+          if (first) h.firstElementChild.classList.add('first');
+          if (OPENING_DASH.test(h.textContent)) h.firstElementChild.classList.add('dialogue');
           html = h.innerHTML;
         }
       }
       first = false;
+      afterBreak = false;
       return html;
     }).join('\n');
   };
@@ -6972,11 +8458,17 @@ function buildHtml(data, opts = {}) {
   .chapter .hd, .contents .hd { text-align: center; letter-spacing: 4px; font-variant-caps: all-small-caps; font-variant-numeric: oldstyle-nums; font-size: 17pt; font-weight: normal; color: #555; margin: 54px 0 36px; }
   .chapter p { text-indent: 2em; margin: 0; }
   .chapter .hd + p, .chapter .byline + p, .brk + p, .chapter p.first { text-indent: 0; }
-  /* an in-flow raised initial: stays inside its word for copy, search,
-     and screen readers, unlike a floated drop cap */
-  ${(library.fonts || {}).dropcap === 'none' ? '' : '.chapter p.first::first-letter { font-size: 1.8em; line-height: 1; }'}
+  .chapter p.dialogue { text-indent: 2em; }
+  /* the drop cap the page sets, two lines deep in its own face. An initial
+     letter, not a float: it stays inside its word, so the PDF's copy,
+     search, and screen readers still find "The" where a float leaves "T"
+     and "he" (a gap much wider than 4px splits the word again). A browser
+     that can't set one gets a raised initial. */
+  ${(library.fonts || {}).dropcap === 'none' ? '' : `.chapter p.first:not(.dialogue)::first-letter { -webkit-initial-letter: 2; initial-letter: 2; padding-right: 4px; font-family: ${exportDropCapFont()}; }
+  @supports not ((initial-letter: 2) or (-webkit-initial-letter: 2)) { .chapter p.first:not(.dialogue)::first-letter { font-size: 1.8em; line-height: 1; padding-right: 0; } }`}
   .brk { text-align: center; text-indent: 0 !important; letter-spacing: 8px; color: #888; margin: 2.5em 0; }
   .chapter p.poetry { text-indent: 0; margin: 0 2.5em; }
+  .chapter p.flush { text-indent: 0 !important; }
   .chapter p:not(.poetry) + p.poetry, .chapter .hd + p.poetry { margin-top: 0.9em; }
   .chapter p.poetry + p:not(.poetry) { margin-top: 0.9em; }
   .chapter p.byline { text-align: center; margin: -24px 0 40px; letter-spacing: 3px; text-transform: uppercase; font-size: 10pt; color: #555; }
@@ -7038,26 +8530,44 @@ const escXml = (s) => String(s)
 // In the manuscript an italic inside an italic is emphasis in a poetry
 // paragraph (itself one italic), and it is set upright, the typesetter's
 // way (flip). Pasted HTML often doubles its italics for nothing; not there.
+// a run's text in the manuscript's own inline tags
+function runHtml(r, esc = escHtml) {
+  let t = esc(r.text);
+  if (r.s) t = '<s>' + t + '</s>';
+  if (r.u) t = '<u>' + t + '</u>';
+  if (r.i) t = '<i>' + t + '</i>';
+  if (r.b) t = '<b>' + t + '</b>';
+  return t;
+}
 function paraRuns(pHtml, flip) {
   const holder = document.createElement('template'); // inert: nothing loads or runs
   holder.innerHTML = pHtml;
   const runs = [];
-  const walk = (node, b, i) => {
+  const walk = (node, b, i, u, x) => {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        if (child.textContent) runs.push({ text: child.textContent.replace(/\u00a0/g, ' '), b, i });
+        if (child.textContent) runs.push({ text: child.textContent.replace(/\u00a0/g, ' '), b, i, u, s: x });
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         if (child.classList && child.classList.contains('ph-mark')) {
           runs.push({ mark: child.dataset.sid || '' });
           continue;
         }
         const tag = child.tagName;
-        const it = tag === 'I' || tag === 'EM';
-        walk(child, b || tag === 'B' || tag === 'STRONG', it ? (flip ? !i : true) : i);
+        // the engine writes bold italic as <b style="font-style: italic"> (or
+        // the other way round) when ⌘I meets ⌘B: the style counts like a tag
+        const st = child.style || {};
+        const fw = String(st.fontWeight || '').toLowerCase();
+        const it = tag === 'I' || tag === 'EM' || String(st.fontStyle || '').toLowerCase() === 'italic';
+        const bo = tag === 'B' || tag === 'STRONG' || fw === 'bold' || parseInt(fw, 10) >= 600;
+        // underline and strikethrough: the engine's tags, or a style
+        const deco = String(st.textDecoration || st.textDecorationLine || '').toLowerCase();
+        const un = tag === 'U' || tag === 'INS' || deco.includes('underline');
+        const st2 = tag === 'S' || tag === 'STRIKE' || tag === 'DEL' || deco.includes('line-through');
+        walk(child, b || bo, it ? (flip ? !i : true) : i, u || un, x || st2);
       }
     }
   };
-  walk(holder.content, false, false);
+  walk(holder.content, false, false, false, false);
   return runs;
 }
 
@@ -7081,7 +8591,7 @@ function docxP(runs, opts = {}) {
     const it = opts.flip ? !r.i : r.i;
     const caps = r.caps !== undefined ? r.caps : opts.caps;
     const size = r.size || opts.size;
-    const rPr = (r.b ? '<w:b/>' : '') + (it ? '<w:i/>' : '')
+    const rPr = (r.b ? '<w:b/>' : '') + (it ? '<w:i/>' : '') + (r.s ? '<w:strike/>' : '') + (r.u ? '<w:u w:val="single"/>' : '')
       + (caps === true ? '<w:caps/>' : caps === false ? '<w:caps w:val="0"/>' : '')
       + (opts.tracking ? `<w:spacing w:val="${opts.tracking}"/>` : '')
       + (size ? `<w:sz w:val="${size}"/>` : '');
@@ -7150,7 +8660,7 @@ function buildDocxEntries(data) {
       if (p.sceneBreak) body.push(docxP([{ text: '***' }], { align: 'center', spaceBefore: 240 }));
       else if (p.poetry) body.push(docxP(paraRuns(p.html), { align: p.align === 'center' || p.align === 'right' ? p.align : '', poetry: true }));
       else if (p.align === 'center' || p.align === 'right') body.push(docxP(paraRuns(p.html), { align: p.align }));
-      else body.push(docxP(paraRuns(p.html), { indent: true }));
+      else body.push(docxP(paraRuns(p.html), { indent: !p.flush }));
     }
   });
   if (!placed) contents();
@@ -7213,6 +8723,8 @@ function chapterXhtml(ch, d) {
   const kind = ch.kind || 'chapter';
   const xhtmlRuns = (p) => paraRuns(p.html).map((r) => {
     let t = escXml(r.text);
+    if (r.s) t = '<s>' + t + '</s>';
+    if (r.u) t = '<u>' + t + '</u>';
     if (r.i) t = '<em>' + t + '</em>';
     if (r.b) t = '<strong>' + t + '</strong>';
     return t;
@@ -7242,7 +8754,12 @@ ${ch.subtitle ? `<p class="sub">${escXml(ch.subtitle)}</p>` : ''}${ch.byline ? `
       if (p.sceneBreak) { first = true; return '<p class="brk">* * *</p>'; }
       const classes = [];
       if (p.poetry) classes.push('poetry');
-      else if (first) classes.push('first');
+      else if (p.flush) classes.push('flush');
+      else if (first) {
+        classes.push('first');
+        // speech keeps its indent, in line with the lines that answer it
+        if (OPENING_DASH.test(p.text || '')) classes.push('dialogue');
+      }
       if (p.align === 'center' || p.align === 'right') classes.push(p.align);
       const cls = classes.length ? ` class="${classes.join(' ')}"` : '';
       if (!p.poetry) first = false;
@@ -7355,10 +8872,12 @@ ${navList(toc)}
 h1 { text-align: center; font-weight: normal; letter-spacing: 0.2em; text-transform: uppercase; font-size: 1.2em; margin: 3em 0 2em; }
 p { text-indent: 1.2em; margin: 0; }
 p.first, p.brk + p, p.byline + p { text-indent: 0; }
+p.first.dialogue:not(.center):not(.right) { text-indent: 1.2em; }
 p.center { text-align: center; text-indent: 0; }
 p.right { text-align: right; text-indent: 0; }
 p.brk { text-align: center; text-indent: 0; margin: 2.5em 0; letter-spacing: 0.5em; }
 p.poetry { text-indent: 0; margin: 0 2em; }
+p.flush { text-indent: 0 !important; }
 p:not(.poetry) + p.poetry, h1 + p.poetry { margin-top: 0.9em; }
 p.poetry + p:not(.poetry) { margin-top: 0.9em; }
 p.byline { text-align: center; text-indent: 0; letter-spacing: 0.2em; text-transform: uppercase; font-size: 0.8em; margin: -1em 0 2em; }
@@ -7513,6 +9032,7 @@ async function shelfBookData(shelf, opts = {}) {
     for (const c of chapters) {
       if (c.kind === 'part') {
         titleParts += 1;
+        if (m.restartNumbering) n = 0; // this title numbers its chapters part by part
         const titled = !!(c.paras[0] && !c.paras[0].sceneBreak && !isAttribution(c.paras[0]));
         const partTitle = titled ? c.paras[0].text : '';
         const s = push({ kind: 'part', heading: partLabel(titleParts), partTitle, level: chLevel, paras: titled ? c.paras.slice(1) : c.paras });
@@ -7524,9 +9044,12 @@ async function shelfBookData(shelf, opts = {}) {
       if (role === 'epilogue') underPart = false;
       const chTitle = (m.chapterTitles || {})[c.chId];
       let heading;
-      if (role) heading = role === 'prologue' ? t('Prologue') : t('Epilogue');
-      else { n += 1; heading = t('Chapter {n}', { n }); }
-      if (chTitle) heading = library.exportCustomChapterTitles ? chTitle : heading + ' — ' + chTitle;
+      if (c.kind === 'unnumbered') heading = chTitle || '';
+      else {
+        if (role) heading = role === 'prologue' ? t('Prologue') : t('Epilogue');
+        else { n += 1; heading = t('Chapter {n}', { n }); }
+        if (chTitle) heading = library.exportCustomChapterTitles ? chTitle : heading + ' — ' + chTitle;
+      }
       const lv = underPart ? chLevel + 1 : chLevel;
       const s = push({ kind: 'chapter', heading, level: lv, paras: c.paras, role: role || '' });
       toc.push({ label: heading, num: s.num, level: lv, type: 'chapter' });
@@ -7670,19 +9193,23 @@ function plainError(err) {
   return String((err && err.message) || err).replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, '');
 }
 
-async function doExport(format) {
+// the whole book, or with chId just that chapter
+async function doExport(format, chId = null) {
   if (!book) { toast(t('Open a book first')); return; }
   flushAllSaves();
-  const defaultName = safeName(book.title);
+  const one = chId ? chapterExportData(chId) : null;
+  if (chId && !one) return;
+  const data = one || undefined;
+  const defaultName = safeName(book.title) + (one ? '-' + safeName(one.chapterOnly) : '');
   try {
     let payload;
-    if (format === 'docx') payload = { format, defaultName, zipEntries: buildDocxEntries() };
-    else if (format === 'epub') payload = { format, defaultName, zipEntries: await buildEpubEntries() };
-    else if (format === 'txt') payload = { format, defaultName, content: buildTxt() };
-    else if (format === 'md') payload = { format, defaultName, content: buildMd() };
+    if (format === 'docx') payload = { format, defaultName, zipEntries: buildDocxEntries(data) };
+    else if (format === 'epub') payload = { format, defaultName, zipEntries: await buildEpubEntries(data) };
+    else if (format === 'txt') payload = { format, defaultName, content: buildTxt(data) };
+    else if (format === 'md') payload = { format, defaultName, content: buildMd(data) };
     else {
-      const data = bookExportData();
-      payload = { format, defaultName, content: buildHtml(data, { cover: await exportCover(data), fonts: await exportFontFaces(data) }) };
+      const d = data || bookExportData();
+      payload = { format, defaultName, content: buildHtml(d, { cover: one ? null : await exportCover(d), fonts: await exportFontFaces(d) }) };
     }
     const saved = await window.neo.exportSave(payload);
     if (saved) toast(t('Exported: {file}', { file: saved.split('/').pop() }));
@@ -7809,16 +9336,7 @@ function updateDialogShow(state, info = {}) {
   later.hidden = false;
   ok.hidden = false;
   bar.hidden = true;
-  if (state === 'offer') {
-    text.textContent = t('You have {version}.', { version: info.currentVersion });
-    ok.textContent = t('Download');
-    ok.onclick = () => { updateDialogShow('starting'); window.neo.downloadUpdate(); };
-  } else if (state === 'starting') {
-    text.textContent = t('Downloading…');
-    bar.hidden = false;
-    fill.style.width = '0%';
-    ok.hidden = true;
-  } else if (state === 'downloading') {
+  if (state === 'downloading') {
     const pct = Math.max(0, Math.min(100, info.percent || 0));
     text.textContent = info.total
       ? t('Downloading… {done} of {total} MB', { done: mb(info.transferred || 0), total: mb(info.total) })
@@ -7850,10 +9368,13 @@ async function checkForUpdate() {
   // of the screen was too easy to miss
   if (res.error) { updateNotice(t('Couldn’t check for updates — try again later')); return; }
   if (!res.hasUpdate) { updateNotice(t('NEO is up to date'), t('You have {version}.', { version: res.currentVersion })); return; }
+  // NEO has been fetching it in the background since it was found: show
+  // where that download is — usually done, with "Restart to update"
   updateDialog = updateDialogBox(res);
   if (!res.canInstall) updateDialogShow('release', res);
   else if (res.ready) updateDialogShow('ready', res);
-  else updateDialogShow('offer', res);
+  else if (res.state === 'error') updateDialogShow('error', res);
+  else updateDialogShow('downloading', res);
 }
 
 function updateNotice(title, line) {
@@ -7879,18 +9400,9 @@ function updateNotice(title, line) {
 }
 
 // messages from the updater in the main process
+// (the download itself is silent: they only matter while the window is open)
 function updateMessage(msg) {
-  if (msg.state === 'available') {
-    // the quiet startup look: one line, once per version
-    if (updateDialog) return;
-    try {
-      if (localStorage.getItem('neo-update-hinted') === msg.version) return;
-      localStorage.setItem('neo-update-hinted', msg.version);
-    } catch { /* fine */ }
-    toast(t('NEO {version} is available — Help → Check for Update… installs it', { version: msg.version }), 7000);
-    return;
-  }
-  if (!updateDialog) return; // nothing open to report to
+  if (!updateDialog || !updateDialog.querySelector('.up-bar')) return; // nothing open to report to
   updateDialogShow(msg.state, msg);
 }
 
@@ -7915,6 +9427,16 @@ async function showAbout() {
   bd.querySelector('.m-ok').focus();
 }
 
+// Text size and the reset travel with page zoom; the menu item and the
+// keyboard fallback share this so the two cannot drift.
+async function setEditorFontSize(value) {
+  const cur = library.editorFontSize || 17;
+  library.editorFontSize = value === 0 ? 17 : Math.min(22, Math.max(14, cur + value));
+  if (value === 0) library.pageZoom = 1; // ⌘0 resets pinch zoom too
+  await writeLibrary(library);
+  keepReadingPlace(applyFonts);
+}
+
 window.neo.onMenu(async (msg) => {
   // full screen and focus mode together hide the bottom bar until hovered
   // (styles.css); the window says when it goes in and out, whatever is open
@@ -7932,6 +9454,11 @@ window.neo.onMenu(async (msg) => {
   if (msg.type === 'checkUpdate') checkForUpdate();
   if (msg.type === 'update') updateMessage(msg);
   if (msg.type === 'export') doExport(msg.format);
+  if (msg.type === 'markdownEmphasis') {
+    if (msg.checked) delete library.markdownOff; else library.markdownOff = true;
+    await writeLibrary(library);
+    toast(msg.checked ? t('Markdown emphasis on: *italic*, **bold**') : t('Markdown emphasis off: asterisks stay asterisks'));
+  }
   if (msg.type === 'exportCustomChapterTitles') {
     library.exportCustomChapterTitles = msg.checked;
     await writeLibrary(library);
@@ -7943,6 +9470,7 @@ window.neo.onMenu(async (msg) => {
   if (msg.type === 'spellLanguage') changeSpellLanguage(msg.value);
   if (msg.type === 'reshelve') reshelveBook();
   if (msg.type === 'typewriter') toggleTypewriter();
+  if (msg.type === 'vim') toggleVim();
   if (msg.type === 'focus') setFocus(msg.value);
   if (msg.type === 'focusCycle') cycleFocus();
   if (msg.type === 'import') importBooks();
@@ -7958,6 +9486,7 @@ window.neo.onMenu(async (msg) => {
     applyAlign(msg.value);
   }
   if (msg.type === 'poetry') togglePoetry();
+  if (msg.type === 'flush') toggleFlush();
   if (msg.type === 'uiLanguage') {
     // save every open page, then reload the window in the new language
     flushAllSaves();
@@ -7980,11 +9509,7 @@ window.neo.onMenu(async (msg) => {
     applyFonts();
   }
   if (msg.type === 'fontSize') {
-    const cur = library.editorFontSize || 17;
-    library.editorFontSize = msg.value === 0 ? 17 : Math.min(22, Math.max(14, cur + msg.value));
-    if (msg.value === 0) library.pageZoom = 1; // ⌘0 resets pinch zoom too
-    await writeLibrary(library);
-    keepReadingPlace(applyFonts);
+    await setEditorFontSize(msg.value);
   }
   if (msg.type === 'bodyFontPick') {
     const name = await pickLocalFont();
@@ -8038,7 +9563,8 @@ const LINUX_BODY_FONTS = {
   'Libre Baskerville': '"Libre Baskerville", Baskerville, Georgia, serif',
   'Alegreya': '"Alegreya", "Hoefler Text", Georgia, serif',
   'Source Serif Pro': '"Source Serif Pro", "Iowan Old Style", Georgia, serif',
-  'Jost': '"Jost", "Avenir Next", "Helvetica Neue", Arial, sans-serif'
+  'Jost': '"Jost", "Avenir Next", "Helvetica Neue", Arial, sans-serif',
+  'iA Writer Quattro': '"iA Writer Quattro", "Helvetica Neue", Arial, sans-serif'
 };
 
 function installLinuxBodyFonts() {
@@ -8093,7 +9619,7 @@ function pressable(el, label) {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); }
   });
 }
-for (const id of ['#author-chip', '#goal-counter', '#word-counter', '#zoom-level']) pressable($(id));
+for (const id of ['#author-chip', '#goal-counter', '#word-counter', '#pos-counter', '#zoom-level']) pressable($(id));
 
 // The mouse leaves nothing focused in the quiet chrome, as before these were
 // focusable: after a click on a book, a chapter row, a tab, a counter or a
@@ -8260,6 +9786,8 @@ loadLibrary().then(() => {
   applyFonts();
   typewriterEnabled = !!library.typewriter;
   applyTypewriter();
+  vimEnabled = !!library.vimKeys;
+  applyVim();
   focusLevel = FOCUS_LEVELS.includes(library.focus) ? library.focus : 'off';
   applyFocus();
 });

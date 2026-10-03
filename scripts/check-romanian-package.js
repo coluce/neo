@@ -22,4 +22,17 @@ for (const file of ['spell-worker.js', 'spell-ro.js']) {
   assert.deepEqual(asar.extractFile(path.join(resources, 'app.asar'), file),
     fs.readFileSync(path.join(root, file)), file);
 }
-console.log('Romanian dictionary source, license notices and worker code verified.');
+const portuguese = path.join(resources, 'app.asar.unpacked/node_modules/dictionary-pt');
+for (const file of ['index.aff', 'index.dic', 'license']) {
+  assert.deepEqual(fs.readFileSync(path.join(portuguese, file)),
+    fs.readFileSync(path.join(root, 'node_modules/dictionary-pt', file)), file);
+}
+for (const file of ['NOTICE.txt', 'MPL-2.0.txt', 'upstream-license.txt']) {
+  assert.deepEqual(fs.readFileSync(path.join(portuguese, file)),
+    fs.readFileSync(path.join(root, 'licenses/dictionary-pt', file)), file);
+}
+for (const file of ['NOTICE.txt', 'MPL-1.1.txt']) {
+  assert.deepEqual(fs.readFileSync(path.join(resources, 'licenses/hunspell', file)),
+    fs.readFileSync(path.join(root, 'licenses/hunspell', file)), file);
+}
+console.log('Romanian and Portuguese dictionaries, Hunspell and license notices, and worker code verified.');

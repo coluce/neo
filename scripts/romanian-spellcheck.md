@@ -1,5 +1,10 @@
 # Romanian dictionary evaluation
 
+> Update, 2026-09-30: NEO now checks spelling with Hunspell (WebAssembly)
+> instead of nspell. Hunspell reads `dictionary-ro` as published, so the
+> flag conversion described below is gone; cedilla normalization stays.
+> The nspell measurements below are kept as the record of that evaluation.
+
 Evaluated on 2026-09-28 with nspell 2.1.5, Node 25.8.1, macOS arm64.
 `dictionary-ro` 3.0.0 was the current npm release. The registry archive
 contains seven files, including `index.aff`, `index.dic`, and `license`,

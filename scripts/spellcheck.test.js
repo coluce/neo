@@ -7,19 +7,13 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const { test } = require('node:test');
-const nspell = require('nspell');
-const { prepareRomanianDictionary } = require('../spell-ro');
 
 const root = path.join(__dirname, '..');
 const localRequire = createRequire(path.join(root, 'main.js'));
 const source = (name) => fs.readFileSync(path.join(root, name), 'utf8');
 
-test('Romanian compatibility keeps suffixes, prefixes and their combinations', () => {
-  const dict = prepareRomanianDictionary({
-    aff: 'SET UTF-8\nSFX A Y 1\nSFX A 0 s .\nPFX A Y 1\nPFX A 0 re .\n',
-    dic: '1\nword/A\n'
-  });
-  const spell = nspell(dict);
+const localRequire = createRequire(path.join(root, 'main.js'));
+const source = (name) => fs.readFileSync(path.join(root, name), 'utf8');
 
 function asyncSpellWorker() {
   let handle;
@@ -40,6 +34,16 @@ function asyncSpellWorker() {
   });
 }
 
+test('Romanian compatibility keeps suffixes, prefixes and their combinations', () => {
+  const dict = prepareRomanianDictionary({
+    aff: 'SET UTF-8\nSFX A Y 1\nSFX A 0 s .\nPFX A Y 1\nPFX A 0 re .\n',
+    dic: '1\nword/A\n'
+  });
+  const spell = nspell(dict);
+  for (const word of ['word', 'words', 'reword', 'rewords']) assert.ok(spell.correct(word), word);
+  assert.equal(spell.correct('wordss'), false);
+});
+
 test('worker loads the Portuguese trie using the main-process message shape', async () => {
   const send = asyncSpellWorker();
   const dictionaryPath = path.join(root, 'dict', 'pt_BR.trie.gz');
@@ -48,22 +52,21 @@ test('worker loads the Portuguese trie using the main-process message shape', as
   assert.equal(result.ok, true);
   assert.deepEqual({ ...result.result }, { biblioteca: true, bibliotca: false });
 });
-  for (const word of ['word', 'words', 'reword', 'rewords']) assert.ok(spell.correct(word), word);
-  assert.equal(spell.correct('wordss'), false);
-});
 
-test('pinned Romanian dictionary fits the single-character flag conversion', () => {
+test('Hunspell reads the pinned Romanian dictionary as published', async () => {
   const dir = path.join(root, 'node_modules/dictionary-ro');
-  const aff = fs.readFileSync(path.join(dir, 'index.aff'), 'utf8');
-  const dic = fs.readFileSync(path.join(dir, 'index.dic'), 'utf8');
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'))).version, '3.0.0');
-  // Re-evaluate the converter before accepting another format or special flags.
-  assert.doesNotMatch(aff, /^(FLAG|AF|COMPOUND\w*|NEEDAFFIX|FORBIDDENWORD|KEEPCASE|CIRCUMFIX|ONLYINCOMPOUND)\s/m);
-  assert.doesNotMatch(aff, /^(?:PFX|SFX)\s+\S+\s+\S+\s+\S*\//m);
-  for (const line of dic.split('\n')) {
-    // Two upstream entries contain stray slashes in their flags; retain them.
-    if (line.includes('/')) assert.match(line, /^[^/]+\/[A-Za-z/]+$/);
-  }
+  const send = asyncSpellWorker();
+  const result = await send({ type: 'load', language: 'ro', dir });
+  assert.equal(result.ok, true);
+});
+  const dir = path.join(root, 'node_modules/dictionary-ro');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'))).version, '3.0.0');
+  const send = spellWorker();
+  assert.equal((await send({ type: 'load', language: 'ro', dir })).ok, true);
+  // prefix + suffix sharing a flag: the case nspell needed converting
+  const res = await send({ type: 'check', words: ['trebui', 'citi', 'merge', 'reciti', 'recitit'] });
+  for (const [word, ok] of Object.entries(res.result)) assert.equal(ok, true, word);
 });
 
 function spellWorker() {
@@ -75,55 +78,64 @@ function spellWorker() {
       postMessage: (message) => { reply = message; }
     } }
   });
-  vm.runInContext(source('spell-worker.js'), context);
+  // The string is the file on disk. filename is how Node attributes coverage to it.
+  vm.runInContext(source('spell-worker.js'), context, { filename: path.join(root, 'spell-worker.js') });
   let id = 0;
-  return (message) => {
-    handle({ data: { id: ++id, ...message } });
-    assert.equal(reply.id, id);
-    return reply;
+  const waiting = new Map();
+  reply = null;
+  // the worker answers asynchronously and in order
+  context.process.parentPort.postMessage = (message) => {
+    const done = waiting.get(message.id);
+    waiting.delete(message.id);
+    if (done) done(message);
   };
+  return (message) => new Promise((resolve) => {
+    const n = ++id;
+    waiting.set(n, (m) => { assert.equal(m.id, n); resolve(m); });
+    handle({ data: { id: n, ...message } });
+  });
 }
 
-test('worker checks Romanian, suggests, learns and switches languages', () => {
+test('worker checks Romanian, suggests, learns and switches languages', async () => {
   const send = spellWorker();
-  const load = (language, pkg, custom = []) => {
-    assert.equal(send({ type: 'load', language, dir: path.join(root, 'node_modules', pkg), custom }).ok, true);
+  const load = async (language, pkg, custom = []) => {
+    assert.equal((await send({ type: 'load', language, dir: path.join(root, 'node_modules', pkg), custom })).ok, true);
   };
-  const check = (words, expected) => {
-    const res = send({ type: 'check', words });
+  const check = async (words, expected) => {
+    const res = await send({ type: 'check', words });
     assert.equal(res.ok, true);
     assert.deepEqual(Object.keys(res.result), words);
     for (const word of words) assert.equal(res.result[word], expected, word);
   };
-  check(['frgament'], true); // no dictionary yet
-  load('ro', 'dictionary-ro', ['Zorţilă']);
-  check(['Acest', 'fragment', 'ar', 'trebui', 'să', 'fie', 'corect',
+  await check(['frgament'], true); // no dictionary yet
+  await load('ro', 'dictionary-ro', ['Zorţilă']);
+  await check(['Acest', 'fragment', 'ar', 'trebui', 'să', 'fie', 'corect',
     'trebuia', 'trebuit', 'trebuiau', 'citi', 'merge', 'reciti', 'recitit',
     'română', 'școală', 'țară', 'Știință', 'mănâncă', 'învățăm', 'sa',
     'şcoală', 'ţară', 'Ştiinţă', 'Țară'.normalize('NFD'),
     'şcoală'.normalize('NFD'), 'română'.normalize('NFD'),
     'Zorțilă', 'Zorţilă'.normalize('NFD')], true);
-  check(['acset', 'frgament', 'coretc', 'școaală', 'scoala', 'țarra'], false);
+  await check(['acset', 'frgament', 'coretc', 'școaală', 'scoala', 'țarra'], false);
   for (const [word, wanted] of [['frgament', 'fragment'], ['coretc', 'corect'],
     ['şcoaală', 'școală'], ['școaală'.normalize('NFD'), 'școală']]) {
-    const suggestions = send({ type: 'suggest', word }).result;
+    const suggestions = (await send({ type: 'suggest', word })).result;
     assert.ok(suggestions.includes(wanted), word);
     assert.ok(suggestions.length <= 6);
   }
-  assert.equal(send({ type: 'add', word: 'Nerțulică'.normalize('NFD') }).ok, true);
-  check(['Nerțulică', 'Nerţulică', 'Nerţulică'.normalize('NFD')], true);
-  assert.equal(send({ type: 'load', language: 'en-US', dir: '/no-such-neo-dictionary' }).ok, false);
-  check(['şcoală', 'trebui'], true); // failed load keeps the previous dictionary and normalization
-  load('en-US', 'dictionary-en-us', ['Zorţilă']);
-  check(['This', 'sentence', 'should', 'be', 'correct', 'Zorţilă'], true);
-  check(['frgament', 'Zorțilă'], false); // Romanian normalization does not leak into English
-  load('ro', 'dictionary-ro', ['Nerţulică']);
-  check(['Nerțulică', 'Nerţulică'.normalize('NFD'), 'trebui'], true);
+  assert.equal((await send({ type: 'add', word: 'Nerțulică'.normalize('NFD') })).ok, true);
+  await check(['Nerțulică', 'Nerţulică', 'Nerţulică'.normalize('NFD')], true);
+  assert.equal((await send({ type: 'load', language: 'en-US', dir: '/no-such-neo-dictionary' })).ok, false);
+  await check(['şcoală', 'trebui'], true); // failed load keeps the previous dictionary and normalization
+  await load('en-US', 'dictionary-en-us', ['Zorţilă']);
+  await check(['This', 'sentence', 'should', 'be', 'correct', 'Zorţilă'], true);
+  await check(['frgament', 'Zorțilă'], false); // Romanian normalization does not leak into English
+  await load('ro', 'dictionary-ro', ['Nerţulică']);
+  await check(['Nerțulică', 'Nerţulică'.normalize('NFD'), 'trebui'], true);
 });
 
 test('learning a Romanian word removes cached Unicode-variant underlines across editors', async () => {
   const send = spellWorker();
-  assert.equal(send({ type: 'load', language: 'ro', dir: path.join(root, 'node_modules/dictionary-ro') }).ok, true);
+  assert.equal((await send({ type: 'load', language: 'ro', dir: path.join(root, 'node_modules/dictionary-ro') })).ok, true);
   const variants = ['Nerţulică', 'Nerțulică', 'Nerțulică'.normalize('NFD')];
   const makeEditor = (text, id) => {
     const node = { data: text, nodeType: 3, isConnected: true };
@@ -160,9 +172,9 @@ test('learning a Romanian word removes cached Unicode-variant underlines across 
     currentTab: 'manuscript', currentChapterId: 'ch-test', library: {},
     captureMenu: (_x, _y, _word, _suggestions, callbacks) => { actions = callbacks; },
     window: { neo: {
-      spellCheckWords: async (words) => send({ type: 'check', words }).result,
-      spellSuggest: async (word) => send({ type: 'suggest', word }).result,
-      spellLearn: async (word) => send({ type: 'add', word }).ok,
+      spellCheckWords: async (words) => (await send({ type: 'check', words })).result,
+      spellSuggest: async (word) => (await send({ type: 'suggest', word })).result,
+      spellLearn: async (word) => (await send({ type: 'add', word })).ok,
       writeLibrary: async (library) => { savedLibrary = JSON.parse(JSON.stringify(library)); }
     } }
   });
@@ -171,7 +183,7 @@ test('learning a Romanian word removes cached Unicode-variant underlines across 
   context.writeLibrary = (lib) => context.window.neo.writeLibrary(lib);
   const app = source('app.js');
   // Use the real scanner, cache and context-menu learn callback. Only DOM
-  // primitives and IPC transport are replaced; the worker loads nspell.
+  // primitives and IPC transport are replaced; the worker loads Hunspell.
   vm.runInContext(app.slice(app.indexOf('let spellOn = false;'), app.indexOf('let typewriterEnabled = false;')), context);
   vm.runInContext('spellOn = true; showSpellMenu = captureMenu;', context);
   await vm.runInContext('Promise.all([spellScanEl(spellElFor("ch-test"), "ch-test"), spellScanEl(spellElFor("aux-notes"), "aux-notes")])', context);
@@ -228,7 +240,8 @@ function mainContext(temp, systemLocale, settings = {}, library = {}, raw = null
     console,
     temp
   });
-  vm.runInContext(source('main.js'), context);
+  // The string is the file on disk. filename is how Node attributes coverage to it.
+  vm.runInContext(source('main.js'), context, { filename: path.join(root, 'main.js') });
   vm.runInContext('LIBRARY_DIR = temp; LIBRARY_FILE = require("path").join(temp, "library.json"); initLanguage(); initSpell();', context);
   return { context, loads, handlers, read: () => JSON.parse(fs.readFileSync(path.join(temp, 'library.json'))) };
 }
@@ -251,7 +264,7 @@ test('spellcheck follows the interface until a dictionary is picked; nothing is 
   await Promise.resolve();
 
   // the same rule for every language: its own dictionary when NEO has one
-  for (const [locale, code] of [['ru_RU', 'ru'], ['fr-CA', 'fr'], ['de', 'de'], ['pl', 'pl'], ['en-US', 'en-US'], ['it', 'en-US'], ['pt-BR', 'en-US']]) {
+  for (const [locale, code] of [['ru_RU', 'ru'], ['fr-CA', 'fr'], ['de', 'de'], ['pl', 'pl'], ['en-US', 'en-US'], ['it', 'en-US'], ['pt-BR', 'pt-BR'], ['pt-PT', 'en-US']]) {
     const ui = mainContext(temp, locale);
     assert.equal(ui.loads[0].language, code, locale);
     assert.equal(ui.read().spellLanguage, undefined);
@@ -274,4 +287,91 @@ test('spellcheck follows the interface until a dictionary is picked; nothing is 
   assert.equal(fs.readFileSync(path.join(temp, 'library.json'), 'utf8'), broken);
   assert.equal(unreadable.loads[0].language, 'ro');
   await Promise.resolve();
+});
+
+test('Brazilian Portuguese: clitics, 1990 reform spellings, hyphenated words', async () => {
+  const send = spellWorker();
+  const dir = path.join(root, 'node_modules/dictionary-pt');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'))).version, '4.0.0');
+  assert.equal((await send({ type: 'load', language: 'pt-BR', dir })).ok, true);
+  const check = async (words, expected) => {
+    const res = await send({ type: 'check', words });
+    for (const word of words) assert.equal(res.result[word], expected, word);
+  };
+  await check(['fazê-lo', 'disse-lhe', 'dir-se-ia', 'amá-lo-ei', 'e-mail', 'guarda-chuva',
+    'ideia', 'voo', 'linguiça', 'coração', 'Brasil', 'escrevendo'], true);
+  await check(['coracao', 'escrevenddo', 'excessão', 'previlégio'], false);
+  assert.ok((await send({ type: 'suggest', word: 'coracao' })).result.includes('coração'));
+});
+
+test('hyphenated words: the whole word first, then only the wrong pieces', async () => {
+  const send = spellWorker();
+  assert.equal((await send({ type: 'load', language: 'en-US', dir: path.join(root, 'node_modules/dictionary-en-us') })).ok, true);
+  const node = { data: 'An e-mail, a well-known x-ray, a well-knwon one, and NASA-style flair.', nodeType: 3, isConnected: true };
+  const el = { node };
+  class TextRange {
+    setStart(n, offset) { this.node = n; this.start = offset; }
+    setEnd(_n, offset) { this.end = offset; }
+    toString() { return this.node.data.slice(this.start, this.end); }
+  }
+  const highlights = new Map();
+  const context = vm.createContext({
+    document: {
+      addEventListener() {},
+      createTreeWalker: () => { let n = node; return { nextNode: () => { const x = n; n = null; return x; } }; }
+    },
+    NodeFilter: { SHOW_TEXT: 4 }, Range: TextRange, Highlight: Set, CSS: { highlights },
+    $: () => null, t: (text) => text, toast() {},
+    window: { neo: { spellCheckWords: async (words) => (await send({ type: 'check', words })).result } }
+  });
+  const app = source('app.js');
+  vm.runInContext(app.slice(app.indexOf('let spellOn = false;'), app.indexOf('let typewriterEnabled = false;')), context);
+  context.el = el;
+  await vm.runInContext('spellOn = true; spellScanEl(el, "ch-test")', context);
+  assert.deepEqual([...highlights.get('neo-spell')].map((r) => r.toString()), ['knwon']);
+});
+
+test('a hyphenated word underlined whole opens the menu; a stammer is no misspelling', async () => {
+  const send = spellWorker();
+  assert.equal((await send({ type: 'load', language: 'pt-BR', dir: path.join(root, 'node_modules/dictionary-pt') })).ok, true);
+  const node = { data: '— E-eu não sei. N-não. Ch-chega! Ela tinha auto-estima, sim.', nodeType: 3, isConnected: true };
+  const editor = { node, id: '', dataset: {}, closest: (selector) => selector === '.chapter' ? { dataset: { id: 'ch-test' } } : editor };
+  class TextRange {
+    setStart(n, offset) { this.node = n; this.start = offset; }
+    setEnd(_n, offset) { this.end = offset; }
+    toString() { return this.node.data.slice(this.start, this.end); }
+  }
+  let contextmenu, menu, selected;
+  const highlights = new Map();
+  const context = vm.createContext({
+    document: {
+      addEventListener: (name, callback) => { if (name === 'contextmenu') contextmenu = callback; },
+      createTreeWalker: () => { let n = node; return { nextNode: () => { const x = n; n = null; return x; } }; },
+      querySelector: () => editor,
+      createRange: () => new TextRange(),
+      // right-click inside "auto", the first piece of the underlined word
+      caretRangeFromPoint: () => ({ startContainer: node, startOffset: node.data.indexOf('auto') + 2 }),
+      execCommand: (_cmd, _ui, text) => { node.data = node.data.slice(0, selected.start) + text + node.data.slice(selected.end); }
+    },
+    Node: { TEXT_NODE: 3 }, NodeFilter: { SHOW_TEXT: 4 }, Range: TextRange, Highlight: Set, CSS: { highlights },
+    $: () => null, t: (text) => text, toast() {},
+    captureMenu: (_x, _y, word, suggestions, actions) => { menu = { word, suggestions, actions }; },
+    window: {
+      getSelection: () => ({ removeAllRanges() {}, addRange: (r) => { selected = r; } }),
+      neo: {
+        spellCheckWords: async (words) => (await send({ type: 'check', words })).result,
+        spellSuggest: async (word) => (await send({ type: 'suggest', word })).result
+      }
+    }
+  });
+  const app = source('app.js');
+  vm.runInContext(app.slice(app.indexOf('let spellOn = false;'), app.indexOf('let typewriterEnabled = false;')), context);
+  context.el = editor;
+  await vm.runInContext('spellOn = true; showSpellMenu = captureMenu; spellScanEl(el, "ch-test")', context);
+  assert.deepEqual([...highlights.get('neo-spell')].map((r) => r.toString()), ['auto-estima']);
+  await contextmenu({ target: editor, clientX: 0, clientY: 0, preventDefault() {} });
+  assert.equal(menu && menu.word, 'auto-estima');
+  assert.ok(menu.suggestions.includes('autoestima'));
+  menu.actions.replace('autoestima');
+  assert.equal(node.data, '— E-eu não sei. N-não. Ch-chega! Ela tinha autoestima, sim.');
 });

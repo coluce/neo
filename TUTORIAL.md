@@ -33,7 +33,11 @@ Note: **there is no spellcheck while you write.** No red squiggles yelling WRONG
 
 **Poetry Paragraph**
 
-A new feature added in v0.8.0: the "Poetry Paragraph." If you SHIFT + ENTER, you'll get an indented paragraph style, default italicized (but you can change it with CTRL + I). It lets you put quotes, poetry, alien chatter, spells being cast, etc. in your manuscript. You can even put a Poetry Paragraph BEFORE the start of a chapter. Just hit SHIFT + ENTER from the chapter title. Or toggle any paragraph to a Poetry Paragraph in the Format menu.
+A new feature added in v0.8.0: the "Poetry Paragraph." If you CTRL + SHIFT + ENTER (⌘⇧Enter on a Mac), you'll get an indented paragraph style, default italicized (but you can change it with CTRL + I). It lets you put quotes, poetry, alien chatter, spells being cast, etc. in your manuscript. You can even put a Poetry Paragraph BEFORE the start of a chapter. Just hit CTRL + SHIFT + ENTER from the chapter title. Or toggle any paragraph to a Poetry Paragraph in the Format menu.
+
+**Flush Paragraph**
+
+SHIFT + ENTER gives you a paragraph with no indent. Hit it again for another, or plain ENTER to go back to regular prose. Good for a report, a list, an email, a sign on a door — anything in your story that isn't prose. You can also un-indent a paragraph you've already written from the Format menu.
 
 **When you need to mark a spot and keep moving**
 
